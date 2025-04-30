@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixflow": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1746019786,
+        "narHash": "sha256-I+WAGLjxS0D8lHPf5/HXx0/IQh8UhssB7RE9iUaYZjc=",
+        "owner": "jackerschott",
+        "repo": "nixflow",
+        "rev": "910e69e356db54b7a51f043c99618beedf332997",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jackerschott",
+        "ref": "main",
+        "repo": "nixflow",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 0,
+        "narHash": "sha256-BPHmb3fUwdHkonHyHi1+x89eXB3kA1jffIpwPVJIVys=",
+        "path": "/nix/store/kk716acdv77mkpdmiv83apbamz639xia-source",
+        "type": "path"
+      },
+      "original": {
+        "id": "nixpkgs",
+        "type": "indirect"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixflow": "nixflow",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
