@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{intrinsics::unreachable, process::Command};
 
 use anyhow::Result;
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
@@ -7,7 +7,8 @@ use thiserror::Error;
 pub enum NixEnvironment {
     Native,
     Container {
-        cache_directory_path: PathBuf,
+        container_cache_directory_path: PathBuf,
+        nix_binary_cache_path: PathBuf,
         apptainer_args: Vec<String>,
     },
 }
@@ -36,12 +37,13 @@ pub enum NixEnvironmentError {
 impl NixEnvironment {
     pub fn new(
         nix_container_url: String,
+        nix_binary_cache_path: PathBuf,
         apptainer_args: Vec<String>,
     ) -> Result<Self, NixEnvironmentError> {
         match Self::new_native() {
             Ok(native_environment) => Ok(native_environment),
             Err(NixEnvironmentError::NixNotAvailable) => {
-                Self::new_container(nix_container_url, apptainer_args)
+                Self::new_container(nix_container_url, nix_binary_cache_path, apptainer_args)
             }
             Err(err) => Err(err),
         }
@@ -56,19 +58,21 @@ impl NixEnvironment {
 
     pub fn new_container(
         nix_container_url: String,
+        nix_binary_cache_path: PathBuf,
         apptainer_args: Vec<String>,
     ) -> Result<Self, NixEnvironmentError> {
-        let cache_directory_path = get_cache_directory_path()
+        let cache_directory_path = get_nixflow_cache_directory_path()
             .map_err(|err| NixEnvironmentError::FailedCacheDirectoryRetreival(err))?;
         let container_env = Self::Container {
-            cache_directory_path,
+            container_cache_directory_path: cache_directory_path,
+            nix_binary_cache_path,
             apptainer_args,
         };
 
-        if !std::fs::exists(container_env.cache_directory_path())
+        if !std::fs::exists(container_env.container_cache_directory_path())
             .map_err(|err| NixEnvironmentError::IOError(err))?
         {
-            std::fs::create_dir_all(container_env.cache_directory_path())
+            std::fs::create_dir_all(container_env.container_cache_directory_path())
                 .map_err(|err| NixEnvironmentError::IOError(err))?;
         }
 
@@ -136,7 +140,7 @@ impl NixEnvironment {
         match self {
             NixEnvironment::Native => unreachable!(),
             NixEnvironment::Container {
-                cache_directory_path: cache_directory,
+                container_cache_directory_path: cache_directory,
                 ..
             } => cache_directory.join("nix.sif"),
         }
@@ -146,19 +150,49 @@ impl NixEnvironment {
         match self {
             NixEnvironment::Native => unreachable!(),
             NixEnvironment::Container {
-                cache_directory_path: cache_directory,
+                container_cache_directory_path: cache_directory,
                 ..
             } => cache_directory.join("store.img"),
         }
     }
 
-    fn cache_directory_path(&self) -> &Path {
+    fn container_cache_directory_path(&self) -> &Path {
         match self {
             NixEnvironment::Native => unreachable!(),
             NixEnvironment::Container {
-                cache_directory_path: cache_directory,
+                container_cache_directory_path: cache_directory,
                 ..
             } => &cache_directory,
+        }
+    }
+
+    pub fn nix_store_binary_execution_command(
+        &self,
+        binary_path: &Path,
+        input_output_directory_paths: &Vec<PathBuf>,
+    ) -> Command {
+        match self {
+            NixEnvironment::Native => Command::new(binary_path),
+            NixEnvironment::Container { .. } => {
+                let mut command = Command::new("apptainer");
+                command
+                    .arg("exec")
+                    .arg("--cleanenv")
+                    .arg("--contain")
+                    .arg("--overlay")
+                    .arg(self.store_image_path());
+
+                for path in input_output_directory_paths {
+                    command.arg("--bind");
+                    command.arg(format!("{path}:{path}"));
+                }
+
+                command
+                    .arg(self.nix_container_cache_path())
+                    .arg(binary_path);
+
+                return command;
+            }
         }
     }
 }
@@ -172,7 +206,7 @@ pub enum CacheDirectoryRetreivalError {
     HomeRetreival(std::env::VarError),
 }
 
-fn get_cache_directory_path() -> Result<PathBuf, CacheDirectoryRetreivalError> {
+fn get_nixflow_cache_directory_path() -> Result<PathBuf, CacheDirectoryRetreivalError> {
     Ok(std::env::var("XDG_CACHE_HOME")
         .map_err(|err| CacheDirectoryRetreivalError::XdgCacheHomeRetreival(err))
         .map(|cache_home| PathBuf::from(cache_home).join("nixflow"))
