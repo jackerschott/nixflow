@@ -6,32 +6,18 @@ use thiserror::Error;
 
 pub enum NixEnvironment {
     Native,
-    Container {
-        container_cache_directory_path: PathBuf,
-        nix_binary_cache_path: PathBuf,
-        apptainer_args: Vec<String>,
+    Portable {
+        store_cache_path: PathBuf,
+    },
+    PortableDistributed {
+        store_cache_path_local: PathBuf,
+        store_cache_path_distributed: PathBuf,
     },
 }
 
 #[derive(Error, Debug)]
 pub enum NixEnvironmentError {
-    #[error("failed to check if nix is available: {0}")]
-    NixAvailabilityCheckError(std::io::Error),
 
-    #[error("nix is not available as a command")]
-    NixNotAvailable,
-
-    #[error("failed to retreive cache directory path: {0}")]
-    FailedCacheDirectoryRetreival(CacheDirectoryRetreivalError),
-
-    #[error("failed to create store image: {0:?}")]
-    FailedStoreImageCreation(Option<std::io::Error>),
-
-    #[error("failed to pull nix container: {0:?}")]
-    FailedNixContainerPull(Option<std::io::Error>),
-
-    #[error("io error: {0}")]
-    IOError(std::io::Error),
 }
 
 impl NixEnvironment {

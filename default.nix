@@ -1,6 +1,10 @@
 { self, pkgs, lib, ... }:
 
-{
+let
+    singleOrListToList = singleOrListToList: if builtins.isList singleOrListToList
+        then singleOrListToList
+        else [singleOrListToList];
+in {
     preamble = {
         output = step: outputName: {
             path = step.outputs.${outputName};
@@ -11,17 +15,25 @@
     };
 
     lib = let
-        collectParentSteps = inputs: (builtins.attrValues (lib.mapAttrs (name: input: input.parentStep) inputs));
-        collectStepRunners = runners: step: if step ? inputs
-            then runners ++ [step.run] ++ (collectParentSteps step.inputs)
-            else runners ++ [step.run];
+        collectParentSteps = outputs: lib.concatLists (builtins.attrValues (lib.mapAttrs
+            (name: inputs: map (input: input.parentStep) (singleOrListToList inputs))
+            outputs));
+        collectStepRunners = outputs: lib.pipe outputs [
+            collectParentSteps
+            (steps: map (step: if step ? inputs
+                then { ${step.name} = step.run; } // (collectStepRunners step.inputs)
+                else { ${step.name} = step.run; }) steps)
+            lib.mergeAttrsList
+        ];
     in {
-        makeStepsPrinter = workflowStepsPath:
+        makeStepsPrinter = workflowSpecificationPath:
             (workflow: pkgs.writers.writeBashBin "steps" '' printf '%s' '${builtins.toJSON workflow}' '')
-            (import workflowStepsPath { nixflow = self.preamble; inherit pkgs lib; });
+            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib; });
 
-        makeStepRunners = workflowStepsPath:
-            (workflow: collectStepRunners [] workflow.parentStep)
-            (import workflowStepsPath { nixflow = self.preamble; inherit pkgs lib; });
+        makeStepRunners = workflowSpecificationPath: {system}: lib.pipe
+            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib; }) [
+            collectStepRunners
+            (runners: lib.mapAttrs (name: runner: { type = "app"; program = "${runner}"; }) runners)
+        ];
     };
 }

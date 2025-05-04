@@ -1,93 +1,84 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
+use scheduler::Scheduler;
 use serde::Deserialize;
 use serde_json::Value;
-use serde_with::{serde_as, KeyValueMap, OneOrMany};
-use std::{
-    collections::HashMap,
-    process::{Command, Stdio},
-};
+use serde_with::{serde_as, KeyValueMap};
+use std::process::{Command, Stdio};
+use step::Step;
 
-use crate::nix_environment::NixEnvironment;
+use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment};
 
-#[derive(Debug, Deserialize)]
-enum OutputPaths {
-    Single(),
-    Multiple(),
+mod executors;
+pub mod scheduler;
+mod step;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommandError {
+    #[error("failed to execute `{command}`\n{io_error}")]
+    Io {
+        command: String,
+        io_error: std::io::Error,
+    },
+
+    #[error("failed to execute `{command}`, exit code {code} is non-zero")]
+    NonZeroExitCode { command: String, code: i32 },
+
+    #[error("failed to execute `{command}`, terminated by a signal")]
+    SignalTermination { command: String },
 }
+impl CommandError {
+    pub fn new_io(command: &Command, io_error: std::io::Error) -> Self {
+        Self::Io {
+            command: format!("{command:?}"),
+            io_error,
+        }
+    }
 
-#[serde_as]
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct InputList {
-    inputs: Vec<Input>,
-}
+    pub fn new_non_zero_exit_code(command: &Command, code: i32) -> Self {
+        Self::NonZeroExitCode {
+            command: format!("{command:?}"),
+            code,
+        }
+    }
 
-trait InputOutput {
-    fn path() -> &Path;
-}
-
-impl InputList {
-    fn paths(&self) -> Result<Vec<PathBuf>> {
-        self.inputs.iter().map(|input| {
-            Ok(camino::absolute_utf8(input.path.clone())
-                .context(format!(
-                    "failed to convert {path} to an absolute path",
-                    path = input.path
-                ))?
-                .parent()
-                .map(|x| x.to_owned())
-                .expect(&format!(
-                    "expected {path} to have a parent, since its absolute \
-                        and checked to not be '/' in the workflow specification
-                        validation",
-                    path = input.path.clone()
-                )))
-        }).collect()
+    pub fn new_signal_termination(command: &Command) -> Self {
+        Self::SignalTermination {
+            command: format!("{command:?}"),
+        }
     }
 }
 
-#[serde_as]
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct OutputList {
-    #[serde_as(as = "OneOrMany<_>")]
-    outputs: Vec<Output>,
-}
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(
+        "failed to generate workflow specification, see above for the associated nix error\n{0}"
+    )]
+    WorkflowSpecificationGenerationFailure(CommandError),
 
-#[derive(Debug, Deserialize)]
-struct Input {
-    path: PathBuf,
+    #[error(
+        "failed to setup files and directories for step `{step_name}` to read/write to\n{io_error}"
+    )]
+    IOSetupFailure {
+        step_name: String,
+        io_error: std::io::Error,
+    },
 
-    #[serde(rename = "parentStep")]
-    parent_step: Step,
-}
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct Output {
-    path: PathBuf,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize)]
-struct Step {
-    name: String,
-
-    #[serde(default)]
-    inputs: HashMap<String, InputList>,
-
-    outputs: HashMap<String, OutputList>,
-
-    #[serde(rename = "run")]
-    run_binary_path: PathBuf,
+    #[error("failed to execute step `{step_name}`\n{execution_error}")]
+    StepExecutionFailure {
+        step_name: String,
+        execution_error: executors::Error,
+    },
 }
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
 struct Target {
     #[serde(rename = "$key$")]
+    #[allow(unused)]
     name: String,
 
+    #[allow(unused)]
     path: PathBuf,
 
     #[serde(rename = "parentStep")]
@@ -114,130 +105,69 @@ impl WorkflowSpecification {
     }
 
     fn generate_specification_string(
-        nix_environment: &NixEnvironment,
+        nix_environment: &Box<dyn NixEnvironment>,
         flake_path: &Path,
-    ) -> Result<String> {
-        let mut command = if nix_environment.is_containerized() {
-            Command::new("apptainer")
-        } else {
-            Command::new("nix")
-        };
-    
-        let home = std::env::var("HOME").context("failed to read HOME")?;
-        let output = match nix_environment {
-            NixEnvironment::Container {
-                nix_binary_cache_path,
-                apptainer_args,
-                ..
-            } => command
-                .arg("exec")
-                .arg("--cleanenv")
-                .arg("--contain")
-                .arg("--env")
-                .arg("NIX_CONFIG=experimental-features = nix-command flakes")
-                .arg("--env")
-                .arg(format!("XDG_CACHE_HOME={nix_binary_cache_path}"))
-                .arg("--overlay")
-                .arg(nix_environment.store_image_path())
-                .arg("--bind")
-                .arg(format!("{flake_path}:{home}/workflow"))
-                .args(apptainer_args)
-                .arg(nix_environment.nix_container_cache_path())
-                .arg("nix"),
-            NixEnvironment::Native => &mut command,
+    ) -> Result<String, Error> {
+        let mut command = Command::new("bash");
+        let nix_run_command = nix_environment.run_command(
+            FlakeOutput::new_default(FlakeSource::Path(flake_path.to_owned())),
+            false,
+        );
+
+        command.arg("-c").arg(nix_run_command.shell_command());
+        let output = command
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|err| {
+                Error::WorkflowSpecificationGenerationFailure(CommandError::new_io(&command, err))
+            })?;
+
+        match output.status.code() {
+            Some(0) => {}
+            Some(code) => {
+                assert!(!output.status.success());
+                return Err(Error::WorkflowSpecificationGenerationFailure(
+                    CommandError::new_non_zero_exit_code(&command, code),
+                ));
+            }
+            None => {
+                return Err(Error::WorkflowSpecificationGenerationFailure(
+                    CommandError::new_signal_termination(&command),
+                ));
+            }
         }
-        .arg("run")
-        .arg("--show-trace")
-        .arg("./workflow")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .context("failed to generate workflow steps")?;
-    
-        if !output.status.success() {
-            bail!("failed to generate workflow steps using `nix run --show-trace workflow`");
-        }
-    
-        let workflow_steps =
-            String::from_utf8(output.stdout).expect("expected nix run output to always be valid utf8");
-    
+
+        let workflow_steps = String::from_utf8(output.stdout)
+            .expect("expected nix run output to always be valid utf8");
+
         Ok(workflow_steps)
     }
 
     pub fn generate(
-        nix_environment: &NixEnvironment,
-        flake_path: &Path,
+        nix_environment: &Box<dyn NixEnvironment>,
+        workflow_flake: &Path,
     ) -> Result<Self> {
-        let specification_string = &Self::generate_specification_string(nix_environment, flake_path)
-            .context(format!("failed to generate workflow specification from `{flake_path}`"))?;
+        let specification_string =
+            &Self::generate_specification_string(nix_environment, workflow_flake).context(
+                format!("failed to generate workflow specification from `{workflow_flake}`"),
+            )?;
 
         Self::parse(specification_string)
             .context(format!("failed to parse generated specification string"))
     }
-}
 
-pub fn execute_workflow_step(step: Step, nix_environment: &NixEnvironment) -> Result<()> {
-    let input_output_directory_paths = Iterator::chain(
-        step.inputs
-            .values()
-            .flat_map(|input_list| input_list.inputs.iter())
-            .map(|input| {
-                Ok(camino::absolute_utf8(input.path.clone())
-                    .context(format!(
-                        "failed to convert {path} to an absolute path",
-                        path = input.path
-                    ))?
-                    .parent()
-                    .map(|x| x.to_owned())
-                    .expect(&format!(
-                        "expected {path} to have a parent, since its absolute \
-                        and checked to not be '/' in the workflow specification
-                        validation",
-                        path = input.path.clone()
-                    )))
-            }),
-        step.outputs
-            .values()
-            .flat_map(|output_list| output_list.outputs.iter())
-            .map(|output| {
-                Ok(camino::absolute_utf8(output.path.clone())
-                    .context(format!(
-                        "failed to convert {path} to an absolute path",
-                        path = output.path
-                    ))?
-                    .parent()
-                    .map(|x| x.to_owned())
-                    .expect(&format!(
-                        "expected {path} to have a parent, since its absolute \
-                        and checked to not be '/' in the workflow specification
-                        validation",
-                        path = output.path
-                    )))
-            }),
-    )
-    .collect::<Result<_>>()
-    .context("bla")?;
+    pub fn schedule<'s>(
+        &'s self,
+        scheduler: &mut Scheduler<'s>,
+        nix_environment: &Box<dyn NixEnvironment>,
+        flake_path: &Path,
+    ) -> Result<(), Error> {
+        for target in self.targets.iter() {
+            target
+                .parent_step
+                .schedule(scheduler, nix_environment, &flake_path)?;
+        }
 
-    let mut command = nix_environment
-        .nix_store_binary_execution_command(&step.run_binary_path, &input_output_directory_paths);
-
-    if !command
-        .status()
-        .context(format!(
-            "failed to execute {name} run binary",
-            name = step.name
-        ))?
-        .success()
-    {
-        bail!(
-            "workflow step {name} finished with a non-zero exit status",
-            name = step.name
-        );
+        Ok(())
     }
-
-    Ok(())
-}
-
-pub fn execute_workflow(specification: WorkflowSpecification) -> Result<()> {
-    Ok(())
 }
