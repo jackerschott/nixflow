@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
+use step::execution::ExecutionError;
 use scheduler::Scheduler;
 use serde::Deserialize;
 use serde_json::Value;
@@ -9,9 +10,8 @@ use step::Step;
 
 use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment};
 
-mod executors;
 pub mod scheduler;
-mod step;
+pub mod step;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
@@ -50,11 +50,11 @@ impl CommandError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+pub enum WorkflowError {
     #[error(
         "failed to generate workflow specification, see above for the associated nix error\n{0}"
     )]
-    WorkflowSpecificationGenerationFailure(CommandError),
+    SpecificationGeneration(CommandError),
 
     #[error(
         "failed to setup files and directories for step `{step_name}` to read/write to\n{io_error}"
@@ -64,11 +64,8 @@ pub enum Error {
         io_error: std::io::Error,
     },
 
-    #[error("failed to execute step `{step_name}`\n{execution_error}")]
-    StepExecutionFailure {
-        step_name: String,
-        execution_error: executors::Error,
-    },
+    #[error("failed to execute job for {0}\n{1}")]
+    JobExecution(String, ExecutionError)
 }
 
 #[serde_as]
@@ -107,7 +104,7 @@ impl WorkflowSpecification {
     fn generate_specification_string(
         nix_environment: &Box<dyn NixEnvironment>,
         flake_path: &Path,
-    ) -> Result<String, Error> {
+    ) -> Result<String, WorkflowError> {
         let mut command = Command::new("bash");
         let nix_run_command = nix_environment.run_command(
             FlakeOutput::new_default(FlakeSource::Path(flake_path.to_owned())),
@@ -119,19 +116,19 @@ impl WorkflowSpecification {
             .stderr(Stdio::inherit())
             .output()
             .map_err(|err| {
-                Error::WorkflowSpecificationGenerationFailure(CommandError::new_io(&command, err))
+                WorkflowError::SpecificationGeneration(CommandError::new_io(&command, err))
             })?;
 
         match output.status.code() {
             Some(0) => {}
             Some(code) => {
                 assert!(!output.status.success());
-                return Err(Error::WorkflowSpecificationGenerationFailure(
+                return Err(WorkflowError::SpecificationGeneration(
                     CommandError::new_non_zero_exit_code(&command, code),
                 ));
             }
             None => {
-                return Err(Error::WorkflowSpecificationGenerationFailure(
+                return Err(WorkflowError::SpecificationGeneration(
                     CommandError::new_signal_termination(&command),
                 ));
             }
@@ -157,12 +154,12 @@ impl WorkflowSpecification {
     }
 
     pub fn schedule<'s>(
-        &'s self,
-        scheduler: &mut Scheduler<'s>,
+        self,
+        scheduler: &mut Scheduler,
         nix_environment: &Box<dyn NixEnvironment>,
         flake_path: &Path,
-    ) -> Result<(), Error> {
-        for target in self.targets.iter() {
+    ) -> Result<(), WorkflowError> {
+        for target in self.targets.into_iter() {
             target
                 .parent_step
                 .schedule(scheduler, nix_environment, &flake_path)?;

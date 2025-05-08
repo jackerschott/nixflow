@@ -1,11 +1,7 @@
 use serde::Deserialize;
-use std::{
-    process::Command,
-    time::Duration,
-};
+use std::{process::Command, time::Duration};
 
-use super::ExecutionCommand;
-use crate::{nix_environment::NixRunCommand, workflow::step::Step};
+use crate::nix_environment::NixRunCommand;
 
 #[derive(Debug, Deserialize)]
 pub struct SlurmExecutor {
@@ -16,17 +12,14 @@ pub struct SlurmExecutor {
 }
 
 impl SlurmExecutor {
-    pub(super) fn execution_command<'s>(&self, step: &'s Step, target: &Box<dyn NixRunCommand>) -> ExecutionCommand<'s> {
-        ExecutionCommand {
-            command: slurm_run_command(
-                target
-                    .command()
-                    .unwrap_or(Command::new("bash").arg("-c").arg(target.shell_command())),
-                &self.account,
-                &self.options,
-            ),
-            step,
-        }
+    pub(super) fn execution_command<'s>(&self, target: &Box<dyn NixRunCommand>) -> Command {
+        slurm_run_command(
+            target
+                .command()
+                .unwrap_or(Command::new("bash").arg("-c").arg(target.shell_command())),
+            &self.account,
+            &self.options,
+        )
     }
 }
 
