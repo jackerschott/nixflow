@@ -17,8 +17,38 @@ pub enum Error {
     },
 }
 
+pub struct NixRunCommandOptions {
+    readonly: bool,
+    buffered: bool,
+}
+
+impl Default for NixRunCommandOptions {
+    fn default() -> Self {
+        Self {
+            readonly: true,
+            buffered: true,
+        }
+    }
+}
+
+impl NixRunCommandOptions {
+    pub fn readwrite(mut self) -> Self {
+        self.readonly = false;
+        self
+    }
+
+    pub fn unbuffered(mut self) -> Self {
+        self.buffered = false;
+        self
+    }
+}
+
 pub trait NixEnvironment {
-    fn run_command(&self, flake_output: FlakeOutput, readonly: bool) -> Box<dyn NixRunCommand>;
+    fn run_command(
+        &self,
+        flake_output: FlakeOutput,
+        options: NixRunCommandOptions,
+    ) -> Box<dyn NixRunCommand>;
 }
 
 pub trait NixRunCommand {
@@ -48,7 +78,10 @@ impl FlakeOutput {
     }
 
     pub fn new(source: FlakeSource, name: String) -> Self {
-        Self { source, name: Some(name) }
+        Self {
+            source,
+            name: Some(name),
+        }
     }
 }
 impl std::fmt::Display for FlakeOutput {
@@ -71,14 +104,24 @@ pub fn build_environment(
         cache_local.parent().expect("").to_owned(),
     )));
 
-    if !force_nix_portable_usage && nix_check_command.status().is_ok_and(|status| status.success()) {
+    if !force_nix_portable_usage
+        && nix_check_command
+            .status()
+            .is_ok_and(|status| status.success())
+    {
         Ok(Box::new(NixNative {}))
-    } else if nix_portable_check_command.status().is_ok_and(|status| status.success()) {
+    } else if nix_portable_check_command
+        .status()
+        .is_ok_and(|status| status.success())
+    {
         Ok(Box::new(NixPortableDistributed {
             cache_local,
             cache_distributed,
         }))
     } else {
-        Err(Error::NixUnavailable { nix_check_command, nix_portable_check_command })
+        Err(Error::NixUnavailable {
+            nix_check_command,
+            nix_portable_check_command,
+        })
     }
 }

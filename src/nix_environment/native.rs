@@ -2,14 +2,14 @@ use std::process::Command;
 
 use crate::commands::shell_command;
 
-use super::{commands::nix_run_command, NixEnvironment, FlakeOutput, NixRunCommand};
+use super::{commands::nix_run_command, FlakeOutput, NixEnvironment, NixRunCommand, NixRunCommandOptions};
 
 pub struct NixNative {}
 
 impl NixEnvironment for NixNative {
-    fn run_command(&self, flake_output: FlakeOutput, _readonly: bool) -> Box<dyn NixRunCommand> {
+    fn run_command(&self, flake_output: FlakeOutput, options: NixRunCommandOptions) -> Box<dyn NixRunCommand> {
         Box::new(NixNativeRunCommand {
-            run: nix_run_command(&flake_output, None)
+            run: nix_run_command(&flake_output, None, options.buffered)
         })
     }
 }

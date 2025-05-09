@@ -8,7 +8,7 @@ use super::{
         nix_cache_distribution_command, nix_distributed_cache_unpacking_command, nix_run_command,
         PortableOptions,
     },
-    NixEnvironment, FlakeOutput, NixRunCommand,
+    FlakeOutput, NixEnvironment, NixRunCommand, NixRunCommandOptions,
 };
 
 pub struct NixPortableDistributed {
@@ -17,7 +17,11 @@ pub struct NixPortableDistributed {
 }
 
 impl NixEnvironment for NixPortableDistributed {
-    fn run_command(&self, flake_output: FlakeOutput, readonly: bool) -> Box<dyn NixRunCommand> {
+    fn run_command(
+        &self,
+        flake_output: FlakeOutput,
+        options: NixRunCommandOptions,
+    ) -> Box<dyn NixRunCommand> {
         let cache_local_parent = self
             .cache_local
             .parent()
@@ -27,12 +31,13 @@ impl NixEnvironment for NixPortableDistributed {
             run: nix_run_command(
                 &flake_output,
                 Some(PortableOptions::new(cache_local_parent.to_owned())),
+                options.buffered,
             ),
             unpack_cache: nix_distributed_cache_unpacking_command(
                 &self.cache_distributed,
                 cache_local_parent,
             ),
-            distribute_cache: (!readonly).then_some(nix_cache_distribution_command(
+            distribute_cache: (!options.readonly).then_some(nix_cache_distribution_command(
                 &self.cache_local,
                 &self.cache_distributed,
             )),

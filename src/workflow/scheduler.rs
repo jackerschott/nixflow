@@ -16,14 +16,20 @@ impl DecoratedRunningJob {
     fn build_progress_bar(job: &RunningJob) -> ProgressBar {
         job.progress_indicator_max()
             .map(|indicator_max| {
-                ProgressBar::new(indicator_max as u64).with_style(
-                    ProgressStyle::default_bar()
-                        .template("{msg} [{wide_bar:40.green/black}] {pos:>3}/{len:3}")
-                        .expect("expected template string to be correct")
-                        .progress_chars("-- "),
-                )
+                ProgressBar::new(indicator_max as u64)
+                    .with_style(
+                        ProgressStyle::default_bar()
+                            .template("[{bar:40.green/black}] {pos:>3}/{len:3} {msg}")
+                            .expect("expected template string to be correct")
+                            .progress_chars("-- "),
+                    )
+                    .with_message(job.step_name().to_owned())
             })
-            .unwrap_or(ProgressBar::new_spinner().with_style(ProgressStyle::default_spinner()))
+            .unwrap_or(
+                ProgressBar::new_spinner()
+                    .with_style(ProgressStyle::default_spinner())
+                    .with_message(job.step_name().to_owned()),
+            )
     }
 
     fn new(job: RunningJob) -> Self {
@@ -43,7 +49,7 @@ impl DecoratedRunningJob {
             .wait()
             .map_err(|err| WorkflowError::JobExecution(step_name, err))?;
 
-        self.bar.finish_and_clear();
+        self.bar.finish();
 
         Ok(())
     }
@@ -87,7 +93,7 @@ impl Scheduler {
             job.execute()
                 .map_err(|err| WorkflowError::JobExecution(step_name, err))?,
         );
-        running_job.bar = progress.add(running_job.bar);
+        running_job.bar = progress.insert_from_back(1, running_job.bar);
         self.running_jobs.push(running_job);
 
         Ok(())
@@ -100,16 +106,20 @@ impl Scheduler {
     ) -> Result<(), WorkflowError> {
         let progress = MultiProgress::new();
         let workflow_progress = progress.add(Self::build_workflow_progress_bar(self.jobs.len()));
+        workflow_progress.set_position(0);
 
         for _ in 0..max_parallel_jobs {
             if let Some(job) = self.jobs.pop_front() {
                 self.start_job(job, &progress)?;
-            } else {
-                return Ok(());
-            };
+            }
         }
 
         loop {
+            if self.running_jobs.len() == 0 {
+                workflow_progress.finish();
+                return Ok(());
+            }
+
             let mut ready_indices = vec![];
             for (index, job) in self.running_jobs.iter_mut().enumerate() {
                 if job.done()? {
@@ -125,8 +135,6 @@ impl Scheduler {
 
                 if let Some(job) = self.jobs.pop_front() {
                     self.start_job(job, &progress)?;
-                } else {
-                    return Ok(());
                 }
             }
         }
@@ -135,9 +143,9 @@ impl Scheduler {
     fn build_workflow_progress_bar(length: usize) -> ProgressBar {
         ProgressBar::new(length as u64).with_style(
             ProgressStyle::default_bar()
-                .template("{msg} [{wide_bar:40.green/black}] {pos:>3}/{len:3}")
+                .template("[{bar:40.green/black}] {pos:>3}/{len:3} {msg}")
                 .expect("expected template string to be correct")
                 .progress_chars("-- "),
-        )
+        ).with_message("workflow")
     }
 }

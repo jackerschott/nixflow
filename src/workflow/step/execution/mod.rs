@@ -11,7 +11,7 @@ use super::{
     progress::{ProgressScanError, ProgressScanner},
     StepInfo,
 };
-use crate::{nix_environment::NixRunCommand, workflow::CommandError};
+use crate::nix_environment::NixRunCommand;
 
 mod default;
 mod slurm;
@@ -81,9 +81,12 @@ impl Job {
             .stdout(Stdio::from(self.log_file))
             .stderr(Stdio::from(log_file_stderr))
             .spawn()
-            .map_err(|err| ExecutionError::Spawn(CommandError::new_io(&self.command, err)))?;
+            .map_err(|err| ExecutionError::Spawn(format!("{:?}", self.command), err))?;
 
-        let progress_scanner = self.step.progress_scanning.as_ref()
+        let progress_scanner = self
+            .step
+            .progress_scanning
+            .as_ref()
             .map(|scanning_info| ProgressScanner::new(scanning_info))
             .transpose()
             .map_err(|err| ExecutionError::ProgressScanSetup(err))?;
@@ -157,14 +160,16 @@ impl RunningJob {
     }
 
     pub fn progress_indicator_max(&self) -> Option<u32> {
-        self.progress_scanner.as_ref().map(|scanner| scanner.indicator_max())
+        self.progress_scanner
+            .as_ref()
+            .map(|scanner| scanner.indicator_max())
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
-    #[error("bla")]
-    Spawn(CommandError),
+    #[error("failed to spawn `{0}`\n{1}")]
+    Spawn(String, std::io::Error),
 
     #[error("failed to duplicate log file handle to `{0}`\n{1}")]
     LogFileDuplication(PathBuf, std::io::Error),

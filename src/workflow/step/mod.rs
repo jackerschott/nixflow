@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
 use std::{collections::HashMap, fs::File};
 
-use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment};
+use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
 
 pub mod execution;
 pub mod progress;
@@ -85,7 +85,7 @@ impl Step {
 
         let run_command = nix_environment.run_command(
             FlakeOutput::new(FlakeSource::Path(flake_path.to_owned()), self.name.clone()),
-            true,
+            NixRunCommandOptions::default().unbuffered()
         );
 
         std::fs::create_dir_all(

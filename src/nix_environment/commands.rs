@@ -16,8 +16,17 @@ impl PortableOptions {
 pub fn nix_run_command(
     flake_output: &FlakeOutput,
     portable_options: Option<PortableOptions>,
+    buffered: bool,
 ) -> Command {
-    let mut command = Command::new("nix");
+    let mut command = if !buffered {
+        let mut command = Command::new("unbuffer");
+        command.arg("nix");
+
+        command
+    } else {
+        Command::new("nix")
+    };
+
     if let Some(portable_options) = portable_options {
         command = Command::new("nix-portable");
         command

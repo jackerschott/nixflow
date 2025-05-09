@@ -8,7 +8,7 @@ use serde_with::{serde_as, KeyValueMap};
 use std::process::{Command, Stdio};
 use step::Step;
 
-use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment};
+use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
 
 pub mod scheduler;
 pub mod step;
@@ -94,10 +94,11 @@ impl WorkflowSpecification {
     pub fn parse(specification: &str) -> Result<Self> {
         // TODO: validate workflow specification, e.g. are input output paths file paths?
         // are they not the root?
-        let v: Value = serde_json::from_str(specification)?;
-        let specification = serde_json::to_string_pretty(&v)?;
-        println!("{}", specification);
-        println!("");
+        //println!("{}", specification);
+        //let v: Value = serde_json::from_str(specification)?;
+        //let specification = serde_json::to_string_pretty(&v)?;
+        //println!("{}", specification);
+        //println!("");
         Ok(serde_json::from_str(&specification).context("failed to deserialize specification")?)
     }
 
@@ -108,7 +109,7 @@ impl WorkflowSpecification {
         let mut command = Command::new("bash");
         let nix_run_command = nix_environment.run_command(
             FlakeOutput::new_default(FlakeSource::Path(flake_path.to_owned())),
-            false,
+            NixRunCommandOptions::default().readwrite()
         );
 
         command.arg("-c").arg(nix_run_command.shell_command());

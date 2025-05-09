@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         .context("failed to schedule workflow")?;
 
     scheduler
-        .execute_scheduled_jobs(10, false)
+        .execute_scheduled_jobs(3, false)
         .context("failed to executed scheduled jobs")?;
 
     Ok(())
