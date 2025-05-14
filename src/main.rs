@@ -3,11 +3,12 @@ use camino::Utf8PathBuf as PathBuf;
 use clap::Parser;
 use nix_environment::build_environment;
 use serde::Deserialize;
-use workflow::{scheduler::Scheduler, WorkflowSpecification};
+use workflow::{graph::{execute_graph, JobGraph}, WorkflowSpecification};
 
 mod commands;
 mod nix_environment;
 mod workflow;
+mod utils;
 
 #[derive(Deserialize)]
 struct GlobalConfig {
@@ -48,14 +49,13 @@ fn main() -> Result<()> {
         WorkflowSpecification::generate(&nix_environment, &cli.workflow_flake_path)
             .context("failed to generate workflow specification")?;
 
-    let mut scheduler = Scheduler::new();
-    workflow_specification
-        .schedule(&mut scheduler, &nix_environment, &cli.workflow_flake_path)
-        .context("failed to schedule workflow")?;
+    let job_graph = JobGraph::new(
+        workflow_specification,
+        &nix_environment,
+        &cli.workflow_flake_path,
+    );
 
-    scheduler
-        .execute_scheduled_jobs(3, false)
-        .context("failed to executed scheduled jobs")?;
+    execute_graph(job_graph, 3, false)?;
 
     Ok(())
 }

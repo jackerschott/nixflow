@@ -1,16 +1,14 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use step::execution::ExecutionError;
-use scheduler::Scheduler;
 use serde::Deserialize;
-use serde_json::Value;
-use serde_with::{serde_as, KeyValueMap};
-use std::process::{Command, Stdio};
+use serde_with::{serde_as, OneOrMany};
+use std::{collections::HashMap, process::{Command, Stdio}};
 use step::Step;
 
 use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
 
-pub mod scheduler;
+pub mod graph;
 pub mod step;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,14 +66,8 @@ pub enum WorkflowError {
     JobExecution(String, ExecutionError)
 }
 
-#[serde_as]
 #[derive(Debug, Deserialize)]
 struct Target {
-    #[serde(rename = "$key$")]
-    #[allow(unused)]
-    name: String,
-
-    #[allow(unused)]
     path: PathBuf,
 
     #[serde(rename = "parentStep")]
@@ -84,10 +76,15 @@ struct Target {
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct TargetList {
+    #[serde_as(as = "OneOrMany<_>")]
+    targets: Vec<Target>
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WorkflowSpecification {
-    #[serde_as(as = "KeyValueMap<_>")]
-    #[serde(flatten)]
-    targets: Vec<Target>,
+    targets: HashMap<String, TargetList>,
 }
 
 impl WorkflowSpecification {
@@ -152,20 +149,5 @@ impl WorkflowSpecification {
 
         Self::parse(specification_string)
             .context(format!("failed to parse generated specification string"))
-    }
-
-    pub fn schedule<'s>(
-        self,
-        scheduler: &mut Scheduler,
-        nix_environment: &Box<dyn NixEnvironment>,
-        flake_path: &Path,
-    ) -> Result<(), WorkflowError> {
-        for target in self.targets.into_iter() {
-            target
-                .parent_step
-                .schedule(scheduler, nix_environment, &flake_path)?;
-        }
-
-        Ok(())
     }
 }
