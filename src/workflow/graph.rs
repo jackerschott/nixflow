@@ -94,13 +94,6 @@ impl JobGraph {
         self.graph.node_weights().all(|job| job.is_finished())
     }
 
-    pub fn running_job_count(&self) -> JobCount {
-        self.graph
-            .node_weights()
-            .filter(|weight| weight.is_running())
-            .count() as JobCount
-    }
-
     pub fn job_ids(&self) -> Vec<NodeIndex> {
         self.graph.nodes_iter().collect()
     }
@@ -135,6 +128,7 @@ pub struct GraphExecutor {
     max_parallel_jobs: JobCount,
     job_count: usize,
     job_execution_index: usize,
+    run_allocated_job_count: JobCount,
     progress: MultiProgress,
 }
 
@@ -144,12 +138,17 @@ impl GraphExecutor {
             max_parallel_jobs,
             job_count,
             job_execution_index: 1,
+            run_allocated_job_count: 0,
             progress: MultiProgress::new(),
         }
     }
 
-    fn build_job_progress(&self, job: &RunningJob) -> ProgressBar {
-        let progress = if let Some(progress_max) = job.progress_max() {
+    fn build_job_progress<S: Into<String>>(
+        &self,
+        progress_max: Option<u32>,
+        step_name: S,
+    ) -> ProgressBar {
+        let progress = if let Some(progress_max) = progress_max {
             ProgressBar::new(progress_max as u64)
                 .with_style(
                     ProgressStyle::default_bar()
@@ -160,7 +159,7 @@ impl GraphExecutor {
                         ))
                         .expect("expected template string to be correct"),
                 )
-                .with_message(job.step_name().to_owned())
+                .with_message(step_name.into())
         } else {
             ProgressBar::new_spinner()
                 .with_style(
@@ -172,7 +171,7 @@ impl GraphExecutor {
                         ))
                         .expect("expected template string to be correct"),
                 )
-                .with_message(job.step_name().to_owned())
+                .with_message(step_name.into())
         };
 
         self.progress.add(progress)
@@ -186,15 +185,21 @@ impl GraphExecutor {
         let mut graph = graph.lock_or_panic();
         let new_state = match graph.job_mut(job_id) {
             Job::Running(running) => running.done()?.then_some(Job::Finishing),
-            Job::Pending(_) => graph 
-                .parents_are_finished(job_id)
-                .then_some(Job::Executing),
+            Job::Pending(_) => (graph.parents_are_finished(job_id) && {
+                // we need to do the check and the increment together atomically
+                let mut executor = executor.write_or_panic();
+                (executor.run_allocated_job_count < executor.max_parallel_jobs)
+                    .then(|| {
+                        executor.run_allocated_job_count += 1;
+                    })
+                    .is_some()
+            })
+            .then_some(Job::Executing),
             Job::Finished(_) => None,
             _ => None,
         };
 
-        Ok(new_state
-            .map(|new_state| std::mem::replace(graph.job_mut(job_id), new_state)))
+        Ok(new_state.map(|new_state| std::mem::replace(graph.job_mut(job_id), new_state)))
     }
 
     fn update_job_state(
@@ -206,14 +211,16 @@ impl GraphExecutor {
         let new_state = match old_state {
             Job::Pending(pending) => {
                 let running = pending.execute();
+
                 let mut executor = executor.write_or_panic();
                 let new_job = match running {
-                    Ok(running) => {
-                        Job::Running(running.with_progress(|job| {
-                            executor.build_job_progress(job)
-                        })?)
-                    }
+                    Ok(running) => Job::Running(running.with_progress(|job| {
+                        executor.build_job_progress(job.progress_max(), job.step_name())
+                    })?),
                     Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
+                        executor
+                            .build_job_progress(None, pending.step_name())
+                            .finish();
                         Job::Finished(pending.finish())
                     }
                     Err(err) => return Err(err),
@@ -222,7 +229,11 @@ impl GraphExecutor {
 
                 new_job
             }
-            Job::Running(running) => Job::Finished(running.finish()?),
+            Job::Running(running) => {
+                let job = Job::Finished(running.finish()?);
+                executor.write_or_panic().run_allocated_job_count -= 1;
+                job
+            }
             _ => unreachable!("continued above for other job states"),
         };
         let _ = std::mem::replace(graph.lock_or_panic().job_mut(job_id), new_state);
@@ -236,7 +247,7 @@ impl GraphExecutor {
         while !graph.lock_or_panic().is_finished() {
             let job_ids = graph.lock_or_panic().job_ids();
             job_ids
-                .into_par_iter()
+                .into_iter()
                 .map(|job_id| {
                     graph.lock_or_panic().update_job(job_id)?;
 
