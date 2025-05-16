@@ -12,6 +12,7 @@ pub struct ProgressScanningInfo {
     pub indicator_regex_pattern: String,
 }
 
+#[derive(Debug)]
 pub struct ProgressScanner {
     info: ProgressScanningInfo,
     indicator_regex: Regex,
@@ -60,10 +61,6 @@ impl ProgressScanner {
             .into_iter()
             .max()
             .unwrap_or(0))
-    }
-
-    pub fn indicator_max(&self) -> u32 {
-        self.info.indicator_max
     }
 }
 

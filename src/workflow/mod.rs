@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
-use step::execution::ExecutionError;
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
 use std::{collections::HashMap, process::{Command, Stdio}};
@@ -53,21 +52,11 @@ pub enum WorkflowError {
         "failed to generate workflow specification, see above for the associated nix error\n{0}"
     )]
     SpecificationGeneration(CommandError),
-
-    #[error(
-        "failed to setup files and directories for step `{step_name}` to read/write to\n{io_error}"
-    )]
-    IOSetupFailure {
-        step_name: String,
-        io_error: std::io::Error,
-    },
-
-    #[error("failed to execute job for {0}\n{1}")]
-    JobExecution(String, ExecutionError)
 }
 
 #[derive(Debug, Deserialize)]
 struct Target {
+    #[allow(unused)]
     path: PathBuf,
 
     #[serde(rename = "parentStep")]

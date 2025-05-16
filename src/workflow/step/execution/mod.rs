@@ -1,12 +1,11 @@
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use default::DefaultExecutor;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use serde::Deserialize;
 use slurm::SlurmExecutor;
 use std::{
     fs::File,
     process::{Child, Command, Stdio},
-    time::Duration,
 };
 
 use super::{
@@ -52,23 +51,25 @@ impl std::fmt::Display for Executor {
     }
 }
 
+#[derive(Debug)]
 pub enum Job {
     Pending(PendingJob),
     Executing,
     Running(RunningJob),
     Finishing,
+    #[allow(unused)]
     Finished(FinishedJob),
 }
 
 impl Job {
     pub fn new(command: Command, step: StepInfo) -> Job {
-        Job::Pending(PendingJob { command, step })
+        Job::Pending(PendingJob::new(command, step))
     }
 
-    pub fn is_pending(&self) -> bool {
+    pub fn update(&mut self) -> Result<(), JobExecutionError> {
         match self {
-            Job::Pending(_) => true,
-            _ => false,
+            Job::Running(running) => running.update_progress(),
+            _ => Ok(()),
         }
     }
 
@@ -79,16 +80,9 @@ impl Job {
         }
     }
 
-    pub fn is_running_and(&self, predicate: impl Fn(&RunningJob) -> bool) -> bool {
-        match self {
-            Job::Running(running) => predicate(running),
-            _ => false,
-        }
-    }
-
     pub fn is_finished(&self) -> bool {
         match self {
-            Job::Finished(finished) => true,
+            Job::Finished(_) => true,
             _ => false,
         }
     }
@@ -189,6 +183,7 @@ impl PendingJob {
     }
 }
 
+#[derive(Debug)]
 pub struct ProgressHandler {
     scanner: Option<ProgressScanner>,
     bar: ProgressBar,
@@ -201,7 +196,7 @@ impl ProgressHandler {
 
     fn update<P: AsRef<Path>>(&mut self, log: &P) -> Result<(), ExecutionError> {
         match &mut self.scanner {
-            None => {}
+            None => self.bar.tick(),
             Some(scan_info) => {
                 let log_contents = std::fs::read_to_string(log.as_ref())
                     .map_err(|err| ExecutionError::ProgressLogRead(log.as_ref().to_owned(), err))?;
@@ -222,6 +217,7 @@ impl ProgressHandler {
     }
 }
 
+#[derive(Debug)]
 pub struct RunningJob {
     child: Child,
     command: Command,
@@ -316,13 +312,14 @@ impl RunningJob {
     }
 }
 
+#[derive(Debug)]
 pub struct FinishedJob {
-    step: StepInfo,
+    _step: StepInfo,
 }
 
 impl FinishedJob {
     pub fn new(step: StepInfo) -> Self {
-        Self { step }
+        Self { _step: step }
     }
 }
 

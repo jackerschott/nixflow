@@ -3,7 +3,7 @@ use camino::Utf8PathBuf as PathBuf;
 use clap::Parser;
 use nix_environment::build_environment;
 use serde::Deserialize;
-use workflow::{graph::{execute_graph, JobGraph}, WorkflowSpecification};
+use workflow::{graph::{GraphExecutor, JobGraph}, WorkflowSpecification};
 
 mod commands;
 mod nix_environment;
@@ -55,7 +55,8 @@ fn main() -> Result<()> {
         &cli.workflow_flake_path,
     );
 
-    execute_graph(job_graph, 3, false)?;
+    let _ = GraphExecutor::new(job_graph.job_count(), 3, false).execute(job_graph);
+
 
     Ok(())
 }

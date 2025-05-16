@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Mutex, RwLock},
     thread::sleep,
     time::Duration,
 };
@@ -11,11 +11,12 @@ use petgraph::{
     data::{Build, DataMapMut},
     graph::{DiGraph, NodeIndex},
 };
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
 
 use crate::{
     nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
-    utils::LockOrPanic,
+    utils::{LockOrPanic, ReadOrPanic, WriteOrPanic},
     workflow::{
         step::{execution::ExecutionError, Step, StepInfo},
         WorkflowSpecification,
@@ -29,6 +30,7 @@ type JobGraphInner = Acyclic<DiGraph<Job, ()>>;
 
 type JobCount = u32;
 
+#[derive(Debug)]
 pub struct JobGraph {
     graph: JobGraphInner,
 }
@@ -92,13 +94,6 @@ impl JobGraph {
         self.graph.node_weights().all(|job| job.is_finished())
     }
 
-    pub fn pending_job_count(&self) -> JobCount {
-        self.graph
-            .node_weights()
-            .filter(|weight| weight.is_pending())
-            .count() as JobCount
-    }
-
     pub fn running_job_count(&self) -> JobCount {
         self.graph
             .node_weights()
@@ -106,18 +101,12 @@ impl JobGraph {
             .count() as JobCount
     }
 
-    pub fn node_ids(&self) -> Vec<NodeIndex> {
+    pub fn job_ids(&self) -> Vec<NodeIndex> {
         self.graph.nodes_iter().collect()
     }
 
     pub fn job_count(&self) -> usize {
         self.graph.node_count()
-    }
-
-    pub fn job(&mut self, node_id: NodeIndex) -> &Job {
-        self.graph
-            .node_weight(node_id)
-            .expect("expected node_id to always come from iteration over existing nodes")
     }
 
     pub fn job_mut(&mut self, node_id: NodeIndex) -> &mut Job {
@@ -136,135 +125,138 @@ impl JobGraph {
                     .is_finished()
             })
     }
-}
 
-fn update_running_jobs(graph: &Arc<Mutex<JobGraph>>) -> Result<(), JobExecutionError> {
-    let node_ids = graph.lock_or_panic().node_ids();
-    for node_id in node_ids {
-        match graph.lock_or_panic().job_mut(node_id) {
-            Job::Running(running) => {
-                if !running.done()? {
-                    running.update_progress()?;
-                    continue;
-                }
-            }
-            _ => continue,
-        };
-
-        // we need to take ownership to finish the job, but we only
-        // have a mutable reference; hence we replace the job with
-        // it's 'Finishing' state
-        let running_job = std::mem::replace(graph.lock_or_panic().job_mut(node_id), Job::Finishing);
-        let finished_job = match running_job {
-            Job::Running(running) => Job::Finished(running.finish()?),
-            _ => unreachable!("continue above for non-running jobs"),
-        };
-        let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), finished_job);
-    }
-
-    Ok(())
-}
-
-fn execute_pending_jobs(
-    graph: &Arc<Mutex<JobGraph>>,
-    progress: &MultiProgress,
-    job_index: &mut usize,
-) -> Result<(), JobExecutionError> {
-    let node_ids = graph.lock_or_panic().node_ids();
-    for node_id in node_ids {
-        if !graph.lock_or_panic().job(node_id).is_pending() {
-            continue;
-        }
-
-        if !graph.lock_or_panic().parents_are_finished(node_id) {
-            continue;
-        }
-
-        // we need to take ownership to execute the job, but we only
-        // have a mutable reference; hence we replace the job with
-        // it's 'Executing' state
-        let pending_job = std::mem::replace(graph.lock_or_panic().job_mut(node_id), Job::Executing);
-        let job = match pending_job {
-            Job::Pending(pending) => match pending.execute() {
-                Ok(running) => Job::Running(running.with_progress(|job| {
-                    progress.add(build_job_progress(
-                        job,
-                        *job_index,
-                        graph.lock_or_panic().job_count(),
-                    ))
-                })?),
-                Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
-                    Job::Finished(pending.finish())
-                }
-                Err(err) => return Err(err),
-            },
-            _ => unreachable!("checked pending above"),
-        };
-        *job_index += 1;
-        let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), job);
-    }
-
-    Ok(())
-}
-
-pub fn build_job_progress(job: &RunningJob, job_index: usize, job_count: usize) -> ProgressBar {
-    if let Some(progress_max) = job.progress_max() {
-        ProgressBar::new(progress_max as u64)
-            .with_style(
-                ProgressStyle::default_bar()
-                    .template(&format!(
-                        "[{job_index}/{job_count}] {{msg:.green}}  {{pos}}/{{len}}"
-                    ))
-                    .expect("expected template string to be correct"),
-            )
-            .with_message(job.step_name().to_owned())
-    } else {
-        let spinner = ProgressBar::new_spinner()
-            .with_style(
-                ProgressStyle::default_spinner()
-                    .template(&format!("[{job_index}/{job_count}] {{msg:.green}} {{spinner}}"))
-                    .expect("expected template string to be correct"),
-            )
-            .with_message(job.step_name().to_owned());
-        spinner.enable_steady_tick(Duration::from_millis(10));
-        spinner
+    fn update_job(&mut self, job_id: NodeIndex) -> Result<(), JobExecutionError> {
+        self.job_mut(job_id).update()
     }
 }
 
-pub fn execute_graph(
-    graph: JobGraph,
+pub struct GraphExecutor {
     max_parallel_jobs: JobCount,
-    _keep_going: bool,
-) -> Result<(), JobExecutionError> {
-    let global_progress = MultiProgress::new();
+    job_count: usize,
+    job_execution_index: usize,
+    progress: MultiProgress,
+}
 
-    let graph = Arc::new(Mutex::new(graph));
-    let graph_ref = graph.clone();
-    let running_job_updater = std::thread::spawn(move || -> Result<(), JobExecutionError> {
-        while !graph_ref.lock_or_panic().is_finished() {
-            update_running_jobs(&graph_ref)?
+impl GraphExecutor {
+    pub fn new(job_count: usize, max_parallel_jobs: JobCount, _keep_going: bool) -> Self {
+        Self {
+            max_parallel_jobs,
+            job_count,
+            job_execution_index: 1,
+            progress: MultiProgress::new(),
         }
+    }
+
+    fn build_job_progress(&self, job: &RunningJob) -> ProgressBar {
+        let progress = if let Some(progress_max) = job.progress_max() {
+            ProgressBar::new(progress_max as u64)
+                .with_style(
+                    ProgressStyle::default_bar()
+                        .template(&format!(
+                            "[{job_index}/{job_count}] {{msg:.green}}  {{pos}}/{{len}}",
+                            job_index = self.job_execution_index,
+                            job_count = self.job_count,
+                        ))
+                        .expect("expected template string to be correct"),
+                )
+                .with_message(job.step_name().to_owned())
+        } else {
+            ProgressBar::new_spinner()
+                .with_style(
+                    ProgressStyle::default_spinner()
+                        .template(&format!(
+                            "[{job_index}/{job_count}] {{msg:.green}} {{spinner}}",
+                            job_index = self.job_execution_index,
+                            job_count = self.job_count,
+                        ))
+                        .expect("expected template string to be correct"),
+                )
+                .with_message(job.step_name().to_owned())
+        };
+
+        self.progress.add(progress)
+    }
+
+    fn try_initialize_job_state_update(
+        executor: &RwLock<&mut Self>,
+        graph: &Mutex<JobGraph>,
+        job_id: NodeIndex,
+    ) -> Result<Option<Job>, JobExecutionError> {
+        let mut graph = graph.lock_or_panic();
+        let new_state = match graph.job_mut(job_id) {
+            Job::Running(running) => running.done()?.then_some(Job::Finishing),
+            Job::Pending(_) => graph 
+                .parents_are_finished(job_id)
+                .then_some(Job::Executing),
+            Job::Finished(_) => None,
+            _ => None,
+        };
+
+        Ok(new_state
+            .map(|new_state| std::mem::replace(graph.job_mut(job_id), new_state)))
+    }
+
+    fn update_job_state(
+        executor: &RwLock<&mut Self>,
+        graph: &Mutex<JobGraph>,
+        job_id: NodeIndex,
+        old_state: Job,
+    ) -> Result<(), JobExecutionError> {
+        let new_state = match old_state {
+            Job::Pending(pending) => {
+                let running = pending.execute();
+                let mut executor = executor.write_or_panic();
+                let new_job = match running {
+                    Ok(running) => {
+                        Job::Running(running.with_progress(|job| {
+                            executor.build_job_progress(job)
+                        })?)
+                    }
+                    Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
+                        Job::Finished(pending.finish())
+                    }
+                    Err(err) => return Err(err),
+                };
+                executor.job_execution_index += 1;
+
+                new_job
+            }
+            Job::Running(running) => Job::Finished(running.finish()?),
+            _ => unreachable!("continued above for other job states"),
+        };
+        let _ = std::mem::replace(graph.lock_or_panic().job_mut(job_id), new_state);
 
         Ok(())
-    });
-
-    let mut job_index = 1;
-    while !graph.lock_or_panic().is_finished() {
-        if graph.lock_or_panic().pending_job_count() == 0
-            || graph.lock_or_panic().running_job_count() >= max_parallel_jobs
-        {
-            sleep(Duration::from_millis(100));
-            continue;
-        }
-
-        execute_pending_jobs(&graph, &global_progress, &mut job_index)?
     }
 
-    running_job_updater
-        .join()
-        .expect("expected the running job updater to not panic")?;
+    pub fn execute(&mut self, graph: JobGraph) -> Result<JobGraph, JobExecutionError> {
+        let executor = RwLock::new(self);
+        let graph = Mutex::new(graph);
+        while !graph.lock_or_panic().is_finished() {
+            let job_ids = graph.lock_or_panic().job_ids();
+            job_ids
+                .into_par_iter()
+                .map(|job_id| {
+                    graph.lock_or_panic().update_job(job_id)?;
 
-    Ok(())
+                    if let Some(old_state) =
+                        Self::try_initialize_job_state_update(&executor, &graph, job_id)?
+                    {
+                        Self::update_job_state(&executor, &graph, job_id, old_state)?
+                    }
+
+                    Ok(())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            sleep(Duration::from_millis(10));
+        }
+
+        Ok(graph
+            .into_inner()
+            .expect("we want to panic when other threads panic"))
+    }
 }
 
 #[derive(Debug, Error)]
