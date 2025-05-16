@@ -221,7 +221,9 @@ impl GraphExecutor {
                         executor
                             .build_job_progress(None, pending.step_name())
                             .finish();
-                        Job::Finished(pending.finish())
+                        let job = Job::Finished(pending.finish());
+                        executor.run_allocated_job_count -= 1;
+                        job
                     }
                     Err(err) => return Err(err),
                 };
