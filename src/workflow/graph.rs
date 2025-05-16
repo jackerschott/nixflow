@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-use super::step::execution::{Job, JobExecutionError};
+use super::step::execution::{Job, JobExecutionError, RunningJob};
 
 // use RefCell here since Acyclic prevents us from modifying the graph
 type JobGraphInner = Acyclic<DiGraph<Job, ()>>;
@@ -138,10 +138,7 @@ impl JobGraph {
     }
 }
 
-fn update_running_jobs(
-    graph: &Arc<Mutex<JobGraph>>,
-    progress: &ProgressBar,
-) -> Result<(), JobExecutionError> {
+fn update_running_jobs(graph: &Arc<Mutex<JobGraph>>) -> Result<(), JobExecutionError> {
     let node_ids = graph.lock_or_panic().node_ids();
     for node_id in node_ids {
         match graph.lock_or_panic().job_mut(node_id) {
@@ -162,7 +159,6 @@ fn update_running_jobs(
             Job::Running(running) => Job::Finished(running.finish()?),
             _ => unreachable!("continue above for non-running jobs"),
         };
-        progress.inc(1);
         let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), finished_job);
     }
 
@@ -172,6 +168,7 @@ fn update_running_jobs(
 fn execute_pending_jobs(
     graph: &Arc<Mutex<JobGraph>>,
     progress: &MultiProgress,
+    job_index: &mut usize,
 ) -> Result<(), JobExecutionError> {
     let node_ids = graph.lock_or_panic().node_ids();
     for node_id in node_ids {
@@ -189,32 +186,49 @@ fn execute_pending_jobs(
         let pending_job = std::mem::replace(graph.lock_or_panic().job_mut(node_id), Job::Executing);
         let job = match pending_job {
             Job::Pending(pending) => match pending.execute() {
+                Ok(running) => Job::Running(running.with_progress(|job| {
+                    progress.add(build_job_progress(
+                        job,
+                        *job_index,
+                        graph.lock_or_panic().job_count(),
+                    ))
+                })?),
                 Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
                     Job::Finished(pending.finish())
                 }
-                result => {
-                    Job::Running(result?.map_progress_bar(|bar| progress.insert_from_back(1, bar)))
-                }
+                Err(err) => return Err(err),
             },
             _ => unreachable!("checked pending above"),
         };
+        *job_index += 1;
         let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), job);
     }
 
     Ok(())
 }
 
-pub fn build_graph_execution_progress(job_count: usize) -> ProgressBar {
-    let progress = ProgressBar::new(job_count as u64)
-        .with_style(
-            ProgressStyle::default_bar()
-                .template("[{bar:40.yellow/black}] {pos:>3}/{len:3} {msg}")
-                .expect("expected template string to be correct")
-                .progress_chars("-- "),
-        )
-        .with_message("finished jobs");
-    progress.set_position(0);
-    return progress;
+pub fn build_job_progress(job: &RunningJob, job_index: usize, job_count: usize) -> ProgressBar {
+    if let Some(progress_max) = job.progress_max() {
+        ProgressBar::new(progress_max as u64)
+            .with_style(
+                ProgressStyle::default_bar()
+                    .template(&format!(
+                        "[{job_index}/{job_count}] {{msg:.green}}  {{pos}}/{{len}}"
+                    ))
+                    .expect("expected template string to be correct"),
+            )
+            .with_message(job.step_name().to_owned())
+    } else {
+        let spinner = ProgressBar::new_spinner()
+            .with_style(
+                ProgressStyle::default_spinner()
+                    .template(&format!("[{job_index}/{job_count}] {{msg:.green}} {{spinner}}"))
+                    .expect("expected template string to be correct"),
+            )
+            .with_message(job.step_name().to_owned());
+        spinner.enable_steady_tick(Duration::from_millis(10));
+        spinner
+    }
 }
 
 pub fn execute_graph(
@@ -223,20 +237,18 @@ pub fn execute_graph(
     _keep_going: bool,
 ) -> Result<(), JobExecutionError> {
     let global_progress = MultiProgress::new();
-    let graph_progress = global_progress.add(build_graph_execution_progress(graph.job_count()));
 
     let graph = Arc::new(Mutex::new(graph));
     let graph_ref = graph.clone();
     let running_job_updater = std::thread::spawn(move || -> Result<(), JobExecutionError> {
         while !graph_ref.lock_or_panic().is_finished() {
-            update_running_jobs(&graph_ref, &graph_progress)?
+            update_running_jobs(&graph_ref)?
         }
-
-        graph_progress.finish();
 
         Ok(())
     });
 
+    let mut job_index = 1;
     while !graph.lock_or_panic().is_finished() {
         if graph.lock_or_panic().pending_job_count() == 0
             || graph.lock_or_panic().running_job_count() >= max_parallel_jobs
@@ -245,7 +257,7 @@ pub fn execute_graph(
             continue;
         }
 
-        execute_pending_jobs(&graph, &global_progress)?
+        execute_pending_jobs(&graph, &global_progress, &mut job_index)?
     }
 
     running_job_updater

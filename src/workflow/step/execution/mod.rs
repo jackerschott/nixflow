@@ -6,6 +6,7 @@ use slurm::SlurmExecutor;
 use std::{
     fs::File,
     process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 use super::{
@@ -180,7 +181,7 @@ impl PendingJob {
             .map_err(|err| ExecutionError::Spawn(format!("{:?}", self.command), err))
             .attach_job_name(self.step_name())?;
 
-        RunningJob::new(child, self.command, self.step)
+        Ok(RunningJob::new(child, self.command, self.step))
     }
 
     pub fn step_name(&self) -> &str {
@@ -194,31 +195,13 @@ pub struct ProgressHandler {
 }
 
 impl ProgressHandler {
-    fn new<M: Into<String>>(progress_scanner: Option<ProgressScanner>, message: M) -> Self {
-        Self {
-            bar: match progress_scanner
-                .as_ref()
-                .map(|scanner| scanner.indicator_max())
-            {
-                Some(indicator_max) => ProgressBar::new(indicator_max as u64)
-                    .with_style(
-                        ProgressStyle::default_bar()
-                            .template("[{bar:40.green/black}] {pos:>3}/{len:3} {msg}")
-                            .expect("expected template string to be correct")
-                            .progress_chars("-- "),
-                    )
-                    .with_message(message.into()),
-                None => ProgressBar::new_spinner()
-                    .with_style(ProgressStyle::default_spinner())
-                    .with_message(message.into()),
-            },
-            scanner: progress_scanner,
-        }
+    fn new(scanner: Option<ProgressScanner>, bar: ProgressBar) -> Self {
+        Self { bar, scanner }
     }
 
     fn update<P: AsRef<Path>>(&mut self, log: &P) -> Result<(), ExecutionError> {
         match &mut self.scanner {
-            None => self.bar.tick(),
+            None => {}
             Some(scan_info) => {
                 let log_contents = std::fs::read_to_string(log.as_ref())
                     .map_err(|err| ExecutionError::ProgressLogRead(log.as_ref().to_owned(), err))?;
@@ -242,26 +225,46 @@ impl ProgressHandler {
 pub struct RunningJob {
     child: Child,
     command: Command,
-    progress: ProgressHandler,
+    progress: Option<ProgressHandler>,
     step: StepInfo,
 }
 
 impl RunningJob {
-    pub fn new(child: Child, command: Command, step: StepInfo) -> Result<Self, JobExecutionError> {
-        let progress_scanner = step
+    pub fn new(child: Child, command: Command, step: StepInfo) -> Self {
+        Self {
+            child,
+            command,
+            progress: None,
+            step,
+        }
+    }
+
+    pub fn progress_max(&self) -> Option<u32> {
+        self.step
+            .progress_scanning
+            .as_ref()
+            .map(|info| info.indicator_max)
+    }
+
+    pub fn with_progress(
+        mut self,
+        build_progress: impl Fn(&Self) -> ProgressBar,
+    ) -> Result<Self, JobExecutionError> {
+        let progress_scanner = self
+            .step
             .progress_scanning
             .as_ref()
             .map(|scanning_info| ProgressScanner::new(scanning_info))
             .transpose()
             .map_err(|err| ExecutionError::ProgressScanSetup(err))
-            .attach_job_name(step.name.clone())?;
+            .attach_job_name(self.step.name.clone())?;
 
-        Ok(Self {
-            child,
-            command,
-            progress: ProgressHandler::new(progress_scanner, step.name.clone()),
-            step,
-        })
+        self.progress = Some(ProgressHandler::new(
+            progress_scanner,
+            build_progress(&self),
+        ));
+
+        Ok(self)
     }
 
     pub fn done(&mut self) -> Result<bool, JobExecutionError> {
@@ -294,7 +297,7 @@ impl RunningJob {
             .attach_job_name(self.step_name()),
         };
 
-        self.progress.finish();
+        self.progress.inspect(|progress| progress.finish());
 
         return finished_job;
     }
@@ -304,14 +307,12 @@ impl RunningJob {
     }
 
     pub fn update_progress(&mut self) -> Result<(), JobExecutionError> {
-        self.progress
-            .update(&self.step.log)
-            .attach_job_name(self.step_name())
-    }
-
-    pub fn map_progress_bar(mut self, f: impl Fn(ProgressBar) -> ProgressBar) -> Self {
-        self.progress.bar = f(self.progress.bar);
-        self
+        match &mut self.progress {
+            Some(progress) => progress
+                .update(&self.step.log)
+                .attach_job_name(self.step_name()),
+            None => Ok(()),
+        }
     }
 }
 

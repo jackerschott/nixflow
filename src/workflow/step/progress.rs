@@ -6,10 +6,10 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProgressScanningInfo {
     #[serde(rename = "indicatorMax")]
-    indicator_max: u32,
+    pub indicator_max: u32,
 
     #[serde(rename = "indicatorRegex")]
-    indicator_regex_pattern: String,
+    pub indicator_regex_pattern: String,
 }
 
 pub struct ProgressScanner {
