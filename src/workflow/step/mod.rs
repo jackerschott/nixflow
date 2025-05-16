@@ -62,6 +62,7 @@ pub struct Step {
     run_binary_path: PathBuf,
 }
 
+#[derive(Debug)]
 pub struct StepInfo {
     name: String,
     inputs: Vec<PathBuf>,

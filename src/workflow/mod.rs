@@ -83,6 +83,7 @@ struct TargetList {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(transparent)]
 pub struct WorkflowSpecification {
     targets: HashMap<String, TargetList>,
 }

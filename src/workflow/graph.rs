@@ -17,7 +17,7 @@ use crate::{
     nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
     utils::LockOrPanic,
     workflow::{
-        step::{Step, StepInfo},
+        step::{execution::ExecutionError, Step, StepInfo},
         WorkflowSpecification,
     },
 };
@@ -46,7 +46,7 @@ impl JobGraph {
             step: Step,
             nix_environment: &Box<dyn NixEnvironment>,
             flake_path: &Path,
-        ) {
+        ) -> NodeIndex {
             let step_info = StepInfo::new(
                 step.name.clone(),
                 step.inputs
@@ -62,19 +62,21 @@ impl JobGraph {
                 step.log,
                 step.progress_scanning,
             );
-
-            for (_, input_list) in step.inputs.into_iter() {
-                for input in input_list.inputs.into_iter() {
-                    add_jobs_from_step(graph, input.parent_step, nix_environment, flake_path);
-                }
-            }
-
             let run_command = nix_environment.run_command(
                 FlakeOutput::new(FlakeSource::Path(flake_path.to_owned()), step.name),
                 NixRunCommandOptions::default().unbuffered(),
             );
 
-            graph.add_node(step.executor.build_job(&run_command, step_info));
+            let id = graph.add_node(step.executor.build_job(&run_command, step_info));
+            for (_, input_list) in step.inputs.into_iter() {
+                for input in input_list.inputs.into_iter() {
+                    let parent_id =
+                        add_jobs_from_step(graph, input.parent_step, nix_environment, flake_path);
+                    graph.add_edge(parent_id, id, ());
+                }
+            }
+
+            return id;
         }
 
         for (_, target_list) in specification.targets.into_iter() {
@@ -136,8 +138,12 @@ impl JobGraph {
     }
 }
 
-fn update_running_jobs(graph: &Arc<Mutex<JobGraph>>, progress: &ProgressBar) -> Result<(), JobExecutionError> {
-    for node_id in graph.lock_or_panic().node_ids() {
+fn update_running_jobs(
+    graph: &Arc<Mutex<JobGraph>>,
+    progress: &ProgressBar,
+) -> Result<(), JobExecutionError> {
+    let node_ids = graph.lock_or_panic().node_ids();
+    for node_id in node_ids {
         match graph.lock_or_panic().job_mut(node_id) {
             Job::Running(running) => {
                 if !running.done()? {
@@ -160,8 +166,6 @@ fn update_running_jobs(graph: &Arc<Mutex<JobGraph>>, progress: &ProgressBar) -> 
         let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), finished_job);
     }
 
-    progress.finish();
-
     Ok(())
 }
 
@@ -169,7 +173,8 @@ fn execute_pending_jobs(
     graph: &Arc<Mutex<JobGraph>>,
     progress: &MultiProgress,
 ) -> Result<(), JobExecutionError> {
-    for node_id in graph.lock_or_panic().node_ids() {
+    let node_ids = graph.lock_or_panic().node_ids();
+    for node_id in node_ids {
         if !graph.lock_or_panic().job(node_id).is_pending() {
             continue;
         }
@@ -182,16 +187,34 @@ fn execute_pending_jobs(
         // have a mutable reference; hence we replace the job with
         // it's 'Executing' state
         let pending_job = std::mem::replace(graph.lock_or_panic().job_mut(node_id), Job::Executing);
-        let running_job = match pending_job {
-            Job::Pending(pending) => {
-                Job::Running(pending.execute()?.map_progress_bar(|bar| progress.add(bar)))
-            }
+        let job = match pending_job {
+            Job::Pending(pending) => match pending.execute() {
+                Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
+                    Job::Finished(pending.finish())
+                }
+                result => {
+                    Job::Running(result?.map_progress_bar(|bar| progress.insert_from_back(1, bar)))
+                }
+            },
             _ => unreachable!("checked pending above"),
         };
-        let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), running_job);
+        let _ = std::mem::replace(graph.lock_or_panic().job_mut(node_id), job);
     }
 
     Ok(())
+}
+
+pub fn build_graph_execution_progress(job_count: usize) -> ProgressBar {
+    let progress = ProgressBar::new(job_count as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("[{bar:40.yellow/black}] {pos:>3}/{len:3} {msg}")
+                .expect("expected template string to be correct")
+                .progress_chars("-- "),
+        )
+        .with_message("finished jobs");
+    progress.set_position(0);
+    return progress;
 }
 
 pub fn execute_graph(
@@ -200,14 +223,7 @@ pub fn execute_graph(
     _keep_going: bool,
 ) -> Result<(), JobExecutionError> {
     let global_progress = MultiProgress::new();
-    let graph_progress = global_progress.add(
-        ProgressBar::new(graph.job_count() as u64).with_style(
-            ProgressStyle::default_bar()
-                .template("[{bar:40.green/black}] {pos:>3}/{len:3} {msg}")
-                .expect("expected template string to be correct")
-                .progress_chars("-- "),
-        ),
-    );
+    let graph_progress = global_progress.add(build_graph_execution_progress(graph.job_count()));
 
     let graph = Arc::new(Mutex::new(graph));
     let graph_ref = graph.clone();
@@ -215,6 +231,8 @@ pub fn execute_graph(
         while !graph_ref.lock_or_panic().is_finished() {
             update_running_jobs(&graph_ref, &graph_progress)?
         }
+
+        graph_progress.finish();
 
         Ok(())
     });

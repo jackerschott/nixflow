@@ -64,7 +64,6 @@ impl Job {
         Job::Pending(PendingJob { command, step })
     }
 
-
     pub fn is_pending(&self) -> bool {
         match self {
             Job::Pending(_) => true,
@@ -88,12 +87,13 @@ impl Job {
 
     pub fn is_finished(&self) -> bool {
         match self {
-            Job::Finished(_) => true,
+            Job::Finished(finished) => true,
             _ => false,
         }
     }
 }
 
+#[derive(Debug)]
 pub struct PendingJob {
     command: Command,
     step: StepInfo,
@@ -139,13 +139,21 @@ impl PendingJob {
             .non_existing_inputs()
             .attach_job_name(self.step_name())?;
         if !non_existing_inputs.is_empty() {
-            return Err(ExecutionError::InputExistence(
+            return Err(ExecutionError::InputExistence(MissingInputPaths(
                 non_existing_inputs
                     .into_iter()
                     .map(|path| path.to_owned())
                     .collect(),
-            ))
+            )))
             .attach_job_name(self.step_name());
+        }
+
+        let non_existing_outputs = self
+            .non_existing_outputs()
+            .attach_job_name(self.step_name())?;
+        if non_existing_outputs.is_empty() {
+            let step_name = self.step_name().to_owned();
+            return Err(ExecutionError::ShouldDirectlyFinish(self)).attach_job_name(step_name);
         }
 
         std::fs::create_dir_all(
@@ -301,10 +309,7 @@ impl RunningJob {
             .attach_job_name(self.step_name())
     }
 
-    pub fn map_progress_bar(
-        mut self,
-        f: impl Fn(ProgressBar) -> ProgressBar,
-    ) -> Self {
+    pub fn map_progress_bar(mut self, f: impl Fn(ProgressBar) -> ProgressBar) -> Self {
         self.progress.bar = f(self.progress.bar);
         self
     }
@@ -320,6 +325,22 @@ impl FinishedJob {
     }
 }
 
+#[derive(Debug)]
+pub struct MissingInputPaths(Vec<PathBuf>);
+impl std::fmt::Display for MissingInputPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.0
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join("\n\t")
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("failed to spawn `{0}`\n{1}")]
@@ -328,11 +349,14 @@ pub enum ExecutionError {
     #[error("failed to check for the existence of {0}\n{1}")]
     InputExistenceCheck(PathBuf, std::io::Error),
 
-    #[error("the following")]
-    InputExistence(Vec<PathBuf>),
+    #[error("the following inputs to not exist:\n\t{0}")]
+    InputExistence(MissingInputPaths),
 
     #[error("failed to check for the existence of {0}\n{1}")]
     OutputExistenceCheck(PathBuf, std::io::Error),
+
+    #[error("the job should be finished directly")]
+    ShouldDirectlyFinish(PendingJob),
 
     #[error("failed to create the parent directory for the specified log file `{0}`\n{1}")]
     LogFileParentDirectoryCreation(PathBuf, std::io::Error),
@@ -364,7 +388,7 @@ pub enum ExecutionError {
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to execute `{0}`\n{1}")]
-pub struct JobExecutionError(String, ExecutionError);
+pub struct JobExecutionError(pub String, pub ExecutionError);
 
 trait AttachJobName<T> {
     fn attach_job_name<S: Into<String>>(self, name: S) -> Result<T, JobExecutionError>;
