@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
-use std::{collections::HashMap, process::{Command, Stdio}};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+};
 use step::Step;
 
 use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
@@ -68,7 +71,7 @@ struct Target {
 #[serde(transparent)]
 struct TargetList {
     #[serde_as(as = "OneOrMany<_>")]
-    targets: Vec<Target>
+    targets: Vec<Target>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,16 +99,13 @@ impl WorkflowSpecification {
         let mut command = Command::new("bash");
         let nix_run_command = nix_environment.run_command(
             FlakeOutput::new_default(FlakeSource::Path(flake_path.to_owned())),
-            NixRunCommandOptions::default().readwrite()
+            NixRunCommandOptions::default().readwrite(),
         );
 
         command.arg("-c").arg(nix_run_command.shell_command());
-        let output = command
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|err| {
-                WorkflowError::SpecificationGeneration(CommandError::new_io(&command, err))
-            })?;
+        let output = command.stderr(Stdio::inherit()).output().map_err(|err| {
+            WorkflowError::SpecificationGeneration(CommandError::new_io(&command, err))
+        })?;
 
         match output.status.code() {
             Some(0) => {}

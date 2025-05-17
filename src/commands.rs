@@ -3,18 +3,18 @@ use std::process::Command;
 pub fn clone_command(cmd: &Command) -> Command {
     let mut cmd_clone = Command::new(cmd.get_program());
     cmd_clone.args(cmd.get_args());
-    
+
     for (k, v) in cmd.get_envs() {
         match v {
             Some(v) => cmd_clone.env(k, v),
             None => cmd_clone.env_remove(k),
         };
     }
-    
+
     if let Some(current_dir) = cmd.get_current_dir() {
         cmd_clone.current_dir(current_dir);
     }
-    
+
     cmd_clone
 }
 

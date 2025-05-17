@@ -3,12 +3,15 @@ use camino::Utf8PathBuf as PathBuf;
 use clap::Parser;
 use nix_environment::build_environment;
 use serde::Deserialize;
-use workflow::{graph::{GraphExecutor, JobGraph}, WorkflowSpecification};
+use workflow::{
+    graph::{GraphExecutor, JobGraph},
+    WorkflowSpecification,
+};
 
 mod commands;
 mod nix_environment;
-mod workflow;
 mod utils;
+mod workflow;
 
 #[derive(Deserialize)]
 struct GlobalConfig {
@@ -56,7 +59,6 @@ fn main() -> Result<()> {
     );
 
     let _ = GraphExecutor::new(job_graph.job_count(), 3, false).execute(job_graph);
-
 
     Ok(())
 }

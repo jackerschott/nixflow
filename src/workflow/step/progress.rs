@@ -41,7 +41,11 @@ impl ProgressScanner {
     pub fn read_progress(&mut self, log_contents: String) -> Result<u32, ProgressScanError> {
         Ok(log_contents
             .lines()
-            .filter_map(|line| self.indicator_regex.captures(line).map(|capture| (line, capture)))
+            .filter_map(|line| {
+                self.indicator_regex
+                    .captures(line)
+                    .map(|capture| (line, capture))
+            })
             .map(|(line, capture)| {
                 let capture_match = capture.get(1).expect(
                     "expected there to be no regex match where there is a \
