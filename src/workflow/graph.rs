@@ -11,19 +11,18 @@ use petgraph::{
     data::{Build, DataMapMut},
     graph::{DiGraph, NodeIndex},
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
 
 use crate::{
     nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
-    utils::{LockOrPanic, ReadOrPanic, WriteOrPanic},
+    utils::{LockOrPanic, WriteOrPanic},
     workflow::{
         step::{execution::ExecutionError, Step, StepInfo},
         WorkflowSpecification,
     },
 };
 
-use super::step::execution::{Job, JobExecutionError, RunningJob};
+use super::step::execution::{Job, JobExecutionError};
 
 // use RefCell here since Acyclic prevents us from modifying the graph
 type JobGraphInner = Acyclic<DiGraph<Job, ()>>;

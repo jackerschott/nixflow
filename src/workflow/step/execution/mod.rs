@@ -73,13 +73,6 @@ impl Job {
         }
     }
 
-    pub fn is_running(&self) -> bool {
-        match self {
-            Job::Running(_) => true,
-            _ => false,
-        }
-    }
-
     pub fn is_finished(&self) -> bool {
         match self {
             Job::Finished(_) => true,
