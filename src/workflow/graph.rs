@@ -16,13 +16,10 @@ use thiserror::Error;
 use crate::{
     nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
     utils::{LockOrPanic, WriteOrPanic},
-    workflow::{
-        step::{execution::ExecutionError, Step, StepInfo},
-        WorkflowSpecification,
-    },
+    workflow::step::{execution::ExecutionError, Step, StepInfo},
 };
 
-use super::step::execution::{Job, JobExecutionError};
+use super::{specification::WorkflowSpecification, step::execution::{Job, JobExecutionError}};
 
 // use RefCell here since Acyclic prevents us from modifying the graph
 type JobGraphInner = Acyclic<DiGraph<Job, ()>>;
@@ -80,8 +77,8 @@ impl JobGraph {
             return id;
         }
 
-        for (_, target_list) in specification.targets.into_iter() {
-            for target in target_list.targets.into_iter() {
+        for (_, targets) in specification.targets.into_iter() {
+            for target in targets.into_iter() {
                 add_jobs_from_step(&mut graph, target.parent_step, nix_environment, flake_path);
             }
         }

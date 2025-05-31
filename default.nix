@@ -27,7 +27,7 @@ in {
         ];
     in {
         makeStepsPrinter = workflowSpecificationPath:
-            (workflow: pkgs.writers.writeBashBin "steps" '' printf '%s' '${builtins.toJSON workflow}' '')
+            (workflow: pkgs.writers.writeBashBin "steps" '' jq . <<< '${builtins.toJSON workflow}' '')
             (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib; });
 
         makeStepRunners = workflowSpecificationPath: {system}: lib.pipe

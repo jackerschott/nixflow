@@ -1,11 +1,12 @@
-use anyhow::{Context, Result};
 use camino::Utf8PathBuf as PathBuf;
 use clap::Parser;
+use miette::{Context, IntoDiagnostic, Result};
 use nix_environment::build_environment;
 use serde::Deserialize;
 use workflow::{
+    generate_specification_string,
     graph::{GraphExecutor, JobGraph},
-    WorkflowSpecification,
+    specification::WorkflowSpecification,
 };
 
 mod commands;
@@ -37,8 +38,10 @@ fn main() -> Result<()> {
             "{workflow}/config.yaml",
             workflow = cli.workflow_flake_path
         ))
+        .into_diagnostic()
         .context("failed to read configuration")?,
     )
+    .into_diagnostic()
     .context("failed to parse configuration")?;
 
     let nix_environment = build_environment(
@@ -46,11 +49,19 @@ fn main() -> Result<()> {
         config.nix_distributed_cache_path,
         cli.force_nix_portable_usage,
     )
+    .into_diagnostic()
     .context("failed to build nix environment")?;
 
-    let workflow_specification =
-        WorkflowSpecification::generate(&nix_environment, &cli.workflow_flake_path)
-            .context("failed to generate workflow specification")?;
+    let specification_string =
+        &generate_specification_string(&nix_environment, &cli.workflow_flake_path)
+            .into_diagnostic()
+            .context(format!(
+                "failed to generate workflow specification from `{workflow_flake}`",
+                workflow_flake = cli.workflow_flake_path
+            ))?;
+
+    let workflow_specification = WorkflowSpecification::parse(specification_string)
+        .context("failed to generate workflow specification")?;
 
     let job_graph = JobGraph::new(
         workflow_specification,
