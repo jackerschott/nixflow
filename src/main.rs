@@ -5,7 +5,7 @@ use nix_environment::build_environment;
 use serde::Deserialize;
 use workflow::{
     generate_specification_string,
-    graph::{GraphExecutor, JobGraph},
+    graph::{ExecutionOptions, GraphExecutor, JobGraph},
     specification::WorkflowSpecification,
 };
 
@@ -69,7 +69,12 @@ fn main() -> Result<()> {
         &cli.workflow_flake_path,
     );
 
-    let _ = GraphExecutor::new(job_graph.job_count(), 3, false).execute(job_graph);
+    let _ = GraphExecutor::new(job_graph.job_count(), 3, false).execute(
+        job_graph,
+        ExecutionOptions {
+            ignore_job_update_failures: false,
+        },
+    );
 
     Ok(())
 }

@@ -1,6 +1,7 @@
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use default::DefaultExecutor;
 use indicatif::ProgressBar;
+use miette::Diagnostic;
 use serde::Deserialize;
 use slurm::SlurmExecutor;
 use std::{
@@ -79,6 +80,20 @@ impl Job {
             _ => false,
         }
     }
+
+    pub fn failed(&self) -> bool {
+        match self {
+            Job::Finished(finished) => finished.failed(),
+            _ => false,
+        }
+    }
+
+    pub fn failed_updates(&self) -> u32 {
+        match self {
+            Job::Running(running) => running.failed_updates,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -119,29 +134,29 @@ impl PendingJob {
         assert!(self
             .non_existing_outputs()
             .is_ok_and(|outputs| outputs.is_empty()));
-        FinishedJob::new(self.step)
+        FinishedJob::new_success(self.step)
+    }
+
+    pub fn terminate(self) -> FinishedJob {
+        FinishedJob::new_terminated(self.step)
     }
 
     pub fn execute(mut self) -> Result<RunningJob, JobExecutionError> {
-        let non_existing_inputs = self
-            .non_existing_inputs()
-            .attach_job_name(self.step_name())?;
+        let non_existing_inputs = self.non_existing_inputs().attach_step_info(&self.step)?;
         if !non_existing_inputs.is_empty() {
-            return Err(ExecutionError::InputExistence(MissingInputPaths(
-                non_existing_inputs
+            return Err(ExecutionError::InputExistence {
+                input_paths: non_existing_inputs
                     .into_iter()
                     .map(|path| path.to_owned())
                     .collect(),
-            )))
-            .attach_job_name(self.step_name());
+            })
+            .attach_step_info(self.step);
         }
 
-        let non_existing_outputs = self
-            .non_existing_outputs()
-            .attach_job_name(self.step_name())?;
+        let non_existing_outputs = self.non_existing_outputs().attach_step_info(&self.step)?;
         if non_existing_outputs.is_empty() {
-            let step_name = self.step_name().to_owned();
-            return Err(ExecutionError::ShouldDirectlyFinish(self)).attach_job_name(step_name);
+            let step = self.step.clone();
+            return Err(ExecutionError::ShouldDirectlyFinish(self)).attach_step_info(step);
         }
 
         std::fs::create_dir_all(
@@ -151,14 +166,14 @@ impl PendingJob {
                 .expect("expected log to be validated as a file path"),
         )
         .map_err(|err| ExecutionError::LogFileParentDirectoryCreation(self.step.log.clone(), err))
-        .attach_job_name(self.step_name())?;
+        .attach_step_info(&self.step)?;
         let log_file = File::create(&self.step.log)
             .map_err(|err| ExecutionError::LogFileCreation(self.step.log.clone(), err))
-            .attach_job_name(self.step_name())?;
+            .attach_step_info(&self.step)?;
         let log_file_stderr = log_file
             .try_clone()
             .map_err(|err| ExecutionError::LogFileDuplication(self.step.log.clone(), err))
-            .attach_job_name(self.step_name())?;
+            .attach_step_info(&self.step)?;
 
         let child = self
             .command
@@ -166,7 +181,7 @@ impl PendingJob {
             .stderr(Stdio::from(log_file_stderr))
             .spawn()
             .map_err(|err| ExecutionError::Spawn(format!("{:?}", self.command), err))
-            .attach_job_name(self.step_name())?;
+            .attach_step_info(&self.step)?;
 
         Ok(RunningJob::new(child, self.command, self.step))
     }
@@ -216,6 +231,8 @@ pub struct RunningJob {
     command: Command,
     progress: Option<ProgressHandler>,
     step: StepInfo,
+    failed_done_polls: u32,
+    failed_updates: u32,
 }
 
 impl RunningJob {
@@ -225,6 +242,8 @@ impl RunningJob {
             command,
             progress: None,
             step,
+            failed_done_polls: 0,
+            failed_updates: 0,
         }
     }
 
@@ -246,7 +265,7 @@ impl RunningJob {
             .map(|scanning_info| ProgressScanner::new(scanning_info))
             .transpose()
             .map_err(|err| ExecutionError::ProgressScanSetup(err))
-            .attach_job_name(self.step.name.clone())?;
+            .attach_step_info(&self.step)?;
 
         self.progress = Some(ProgressHandler::new(
             progress_scanner,
@@ -257,12 +276,16 @@ impl RunningJob {
     }
 
     pub fn done(&mut self) -> Result<bool, JobExecutionError> {
-        Ok(self
+        let result = self
             .child
             .try_wait()
             .map_err(|err| ExecutionError::Wait(format!("{:?}", self.command), err))
-            .attach_job_name(self.step_name())?
-            .is_some())
+            .attach_step_info(&self.step);
+        if result.is_err() {
+            self.failed_done_polls += 1;
+        }
+
+        Ok(result?.is_some())
     }
 
     pub fn finish(mut self) -> Result<FinishedJob, JobExecutionError> {
@@ -270,25 +293,34 @@ impl RunningJob {
             .child
             .wait()
             .map_err(|err| ExecutionError::Wait(format!("{:?}", &self.command), err))
-            .attach_job_name(self.step_name())?
+            .attach_step_info(&self.step)?
             .code()
         {
-            Some(0) => Ok(FinishedJob::new(self.step)),
-            Some(code) => Err(ExecutionError::NonZeroExitCode(
-                format!("{:?}", self.command),
-                code,
-            ))
-            .attach_job_name(self.step_name()),
-            None => Err(ExecutionError::SignalTermination(format!(
-                "{:?}",
-                self.command
-            )))
-            .attach_job_name(self.step_name()),
+            Some(0) => FinishedJob::new_success(self.step),
+            Some(code) => FinishedJob::new_failure(
+                self.step,
+                ExecutionError::NonZeroExitCode(format!("{:?}", self.command), code),
+            ),
+            None => FinishedJob::new_failure(
+                self.step,
+                ExecutionError::SignalTermination(format!("{:?}", self.command)),
+            ),
         };
 
         self.progress.inspect(|progress| progress.finish());
 
-        return finished_job;
+        return Ok(finished_job);
+    }
+
+    pub fn terminate(mut self) -> Result<FinishedJob, JobExecutionError> {
+        self.child
+            .kill()
+            .map_err(|err| ExecutionError::Kill(format!("{:?}", &self.command), err))
+            .attach_step_info(&self.step)?;
+
+        self.progress.inspect(|progress| progress.finish());
+
+        return Ok(FinishedJob::new_success(self.step));
     }
 
     pub fn step_name(&self) -> &str {
@@ -296,39 +328,56 @@ impl RunningJob {
     }
 
     pub fn update_progress(&mut self) -> Result<(), JobExecutionError> {
-        match &mut self.progress {
-            Some(progress) => progress
-                .update(&self.step.log)
-                .attach_job_name(self.step_name()),
+        let result = match &mut self.progress {
+            Some(progress) => progress.update(&self.step.log).attach_step_info(&self.step),
             None => Ok(()),
+        };
+
+        if result.is_err() {
+            self.failed_updates += 1;
         }
+
+        return result;
     }
 }
 
 #[derive(Debug)]
-pub struct FinishedJob {
-    _step: StepInfo,
+pub enum FinishedJob {
+    Success {
+        step: StepInfo,
+    },
+    Failure {
+        error: ExecutionError,
+        step: StepInfo,
+    },
+    Terminated {
+        step: StepInfo,
+    },
 }
 
 impl FinishedJob {
-    pub fn new(step: StepInfo) -> Self {
-        Self { _step: step }
+    pub fn new_success(step: StepInfo) -> Self {
+        Self::Success { step }
     }
-}
 
-#[derive(Debug)]
-pub struct MissingInputPaths(Vec<PathBuf>);
-impl std::fmt::Display for MissingInputPaths {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.0
-                .iter()
-                .map(|path| format!("`{path}`"))
-                .collect::<Vec<_>>()
-                .join("\n\t")
-        )
+    pub fn new_failure(step: StepInfo, error: ExecutionError) -> Self {
+        Self::Failure { step, error }
+    }
+
+    pub fn new_terminated(step: StepInfo) -> Self {
+        Self::Terminated { step }
+    }
+
+    pub fn failed(&self) -> bool {
+        matches!(self, FinishedJob::Failure { .. })
+    }
+
+    pub fn success(&self) -> bool {
+        matches!(self, FinishedJob::Success { .. })
+    }
+
+    pub fn terminated(&self) -> bool {
+        matches!(self, FinishedJob::Terminated { .. })
     }
 }
 
@@ -340,8 +389,8 @@ pub enum ExecutionError {
     #[error("failed to check for the existence of {0}\n{1}")]
     InputExistenceCheck(PathBuf, std::io::Error),
 
-    #[error("the following inputs to not exist:\n\t{0}")]
-    InputExistence(MissingInputPaths),
+    #[error("the following inputs do not exist:\n\t{}", input_paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join("\n\t"))]
+    InputExistence { input_paths: Vec<PathBuf> },
 
     #[error("failed to check for the existence of {0}\n{1}")]
     OutputExistenceCheck(PathBuf, std::io::Error),
@@ -361,6 +410,9 @@ pub enum ExecutionError {
     #[error("failed to poll `{0}`\n{1}")]
     Wait(String, std::io::Error),
 
+    #[error("failed to kill `{0}`\n{1}")]
+    Kill(String, std::io::Error),
+
     #[error("failed to execute `{0}`, terminated by a signal")]
     SignalTermination(String),
 
@@ -377,16 +429,29 @@ pub enum ExecutionError {
     ProgressScan(PathBuf, ProgressScanError),
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("failed to execute `{0}`\n{1}")]
-pub struct JobExecutionError(pub String, pub ExecutionError);
-
-trait AttachJobName<T> {
-    fn attach_job_name<S: Into<String>>(self, name: S) -> Result<T, JobExecutionError>;
+#[derive(Debug, thiserror::Error, Diagnostic)]
+#[error(
+    "failed to execute `{name}`\n\
+    {error}\n\
+    check {log} or execute nixflow with `--inspect {name}` to inspect the job output",
+    name = step.name,
+    log = step.log,
+)]
+#[diagnostic(help("try doing this instead"))]
+pub struct JobExecutionError {
+    pub step: StepInfo,
+    pub error: ExecutionError,
 }
 
-impl<T> AttachJobName<T> for Result<T, ExecutionError> {
-    fn attach_job_name<S: Into<String>>(self, job_name: S) -> Result<T, JobExecutionError> {
-        self.map_err(|err| JobExecutionError(job_name.into(), err))
+pub trait AttachStepInfo<T> {
+    fn attach_step_info<S: Into<StepInfo>>(self, step: S) -> Result<T, JobExecutionError>;
+}
+
+impl<T> AttachStepInfo<T> for Result<T, ExecutionError> {
+    fn attach_step_info<S: Into<StepInfo>>(self, step: S) -> Result<T, JobExecutionError> {
+        self.map_err(|error| JobExecutionError {
+            step: step.into(),
+            error,
+        })
     }
 }

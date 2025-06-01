@@ -6,20 +6,28 @@ use std::{
 
 use camino::Utf8Path as Path;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use miette::IntoDiagnostic;
 use petgraph::{
     acyclic::Acyclic,
     data::{Build, DataMapMut},
     graph::{DiGraph, NodeIndex},
 };
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
 
 use crate::{
     nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
     utils::{LockOrPanic, WriteOrPanic},
-    workflow::step::{execution::ExecutionError, Step, StepInfo},
+    workflow::step::{
+        execution::{AttachStepInfo, ExecutionError, FinishedJob},
+        Step, StepInfo,
+    },
 };
 
-use super::{specification::WorkflowSpecification, step::execution::{Job, JobExecutionError}};
+use super::{
+    specification::WorkflowSpecification,
+    step::execution::{Job, JobExecutionError},
+};
 
 // use RefCell here since Acyclic prevents us from modifying the graph
 type JobGraphInner = Acyclic<DiGraph<Job, ()>>;
@@ -90,6 +98,10 @@ impl JobGraph {
         self.graph.node_weights().all(|job| job.is_finished())
     }
 
+    pub fn failed_job_count(&self) -> usize {
+        self.graph.node_weights().filter(|job| job.failed()).count()
+    }
+
     pub fn job_ids(&self) -> Vec<NodeIndex> {
         self.graph.nodes_iter().collect()
     }
@@ -115,8 +127,18 @@ impl JobGraph {
             })
     }
 
-    fn update_job(&mut self, job_id: NodeIndex) -> Result<(), JobExecutionError> {
-        self.job_mut(job_id).update()
+    fn update_job(
+        &mut self,
+        job_id: NodeIndex,
+        ignore_failure: bool,
+    ) -> Result<(), JobExecutionError> {
+        let result = self.job_mut(job_id).update();
+
+        if ignore_failure {
+            Ok(())
+        } else {
+            result
+        }
     }
 }
 
@@ -213,7 +235,10 @@ impl GraphExecutor {
                     Ok(running) => Job::Running(running.with_progress(|job| {
                         executor.build_job_progress(job.progress_max(), job.step_name())
                     })?),
-                    Err(JobExecutionError(_, ExecutionError::ShouldDirectlyFinish(pending))) => {
+                    Err(JobExecutionError {
+                        step: _,
+                        error: ExecutionError::ShouldDirectlyFinish(pending),
+                    }) => {
                         executor
                             .build_job_progress(None, pending.step_name())
                             .finish();
@@ -228,9 +253,9 @@ impl GraphExecutor {
                 new_job
             }
             Job::Running(running) => {
-                let job = Job::Finished(running.finish()?);
+                let finished = running.finish()?;
                 executor.write_or_panic().run_allocated_job_count -= 1;
-                job
+                Job::Finished(finished)
             }
             _ => unreachable!("continued above for other job states"),
         };
@@ -239,15 +264,21 @@ impl GraphExecutor {
         Ok(())
     }
 
-    pub fn execute(&mut self, graph: JobGraph) -> Result<JobGraph, JobExecutionError> {
+    pub fn execute(
+        &mut self,
+        graph: JobGraph,
+        options: ExecutionOptions,
+    ) -> Result<(), JobExecutionError> {
         let executor = RwLock::new(self);
         let graph = Mutex::new(graph);
         while !graph.lock_or_panic().is_finished() {
             let job_ids = graph.lock_or_panic().job_ids();
             job_ids
-                .into_iter()
+                .into_par_iter()
                 .map(|job_id| {
-                    graph.lock_or_panic().update_job(job_id)?;
+                    graph
+                        .lock_or_panic()
+                        .update_job(job_id, options.ignore_job_update_failures)?;
 
                     if let Some(old_state) =
                         Self::try_initialize_job_state_update(&executor, &graph, job_id)?
@@ -259,13 +290,49 @@ impl GraphExecutor {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            if graph.lock_or_panic().failed_job_count() > 0 {
+                break;
+            }
+
             sleep(Duration::from_millis(10));
         }
 
-        Ok(graph
+        let graph = graph
             .into_inner()
-            .expect("we want to panic when other threads panic"))
+            .expect("expected no panics in other threads");
+        let jobs: Vec<Job> = graph
+            .graph
+            .into_inner()
+            .into_nodes_edges()
+            .0
+            .into_iter()
+            .map(|node| match node.weight {
+                Job::Finished(finished) => Job::Finished(finished),
+                Job::Running(running) => Job::Finished(running.terminate().unwrap()),
+                Job::Pending(pending) => Job::Finished(pending.terminate()),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        jobs.into_iter().for_each(|job| match job {
+            Job::Finished(FinishedJob::Failure { step, error }) => {
+                println!(
+                    "{:?}",
+                    Err::<(), _>(error)
+                        .attach_step_info(step)
+                        .into_diagnostic()
+                        .unwrap_err()
+                );
+            }
+            _ => {}
+        });
+
+        Ok(())
     }
+}
+
+pub struct ExecutionOptions {
+    pub ignore_job_update_failures: bool,
 }
 
 #[derive(Debug, Error)]

@@ -62,9 +62,9 @@ pub struct Step {
     run_binary_path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StepInfo {
-    name: String,
+    pub name: String,
     inputs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
     log: PathBuf,
@@ -86,5 +86,11 @@ impl StepInfo {
             log,
             progress_scanning,
         }
+    }
+}
+
+impl Into<StepInfo> for &StepInfo {
+    fn into(self) -> StepInfo {
+        self.clone()
     }
 }
