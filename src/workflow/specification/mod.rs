@@ -13,6 +13,7 @@ mod parsing;
 
 #[derive(Debug, Deserialize)]
 pub struct TargetItem {
+    #[allow(unused)]
     path: PathBuf,
 
     #[serde(rename = "parentStep")]

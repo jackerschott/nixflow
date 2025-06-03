@@ -5,13 +5,12 @@ use nix_environment::build_environment;
 use serde::Deserialize;
 use workflow::{
     generate_specification_string,
-    graph::{ExecutionOptions, GraphExecutor, JobGraph},
+    graph::{GraphExecutionOptions, JobGraph, execute_job_graph},
     specification::WorkflowSpecification,
 };
 
 mod commands;
 mod nix_environment;
-mod utils;
 mod workflow;
 
 #[derive(Deserialize)]
@@ -69,12 +68,14 @@ fn main() -> Result<()> {
         &cli.workflow_flake_path,
     );
 
-    let _ = GraphExecutor::new(job_graph.job_count(), 3, false).execute(
+    execute_job_graph(
         job_graph,
-        ExecutionOptions {
-            ignore_job_update_failures: false,
+        GraphExecutionOptions {
+            max_parallel_jobs: 3,
+            only_warn_job_update_failures: false,
+            keep_going: false,
         },
-    );
+    )?;
 
     Ok(())
 }

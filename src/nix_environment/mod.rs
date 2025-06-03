@@ -77,10 +77,10 @@ impl FlakeOutput {
         Self { source, name: None }
     }
 
-    pub fn new(source: FlakeSource, name: String) -> Self {
+    pub fn new<S: Into<String>>(source: FlakeSource, name: S) -> Self {
         Self {
             source,
-            name: Some(name),
+            name: Some(name.into()),
         }
     }
 }

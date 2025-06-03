@@ -5,13 +5,16 @@ use miette::Diagnostic;
 use serde::Deserialize;
 use slurm::SlurmExecutor;
 use std::{
+    cell::RefCell,
+    fmt::Display,
     fs::File,
     process::{Child, Command, Stdio},
+    rc::Rc,
 };
 
 use super::{
-    progress::{ProgressScanError, ProgressScanner},
     StepInfo,
+    progress::{ProgressScanError, ProgressScanner},
 };
 use crate::nix_environment::NixRunCommand;
 
@@ -55,44 +58,85 @@ impl std::fmt::Display for Executor {
 #[derive(Debug)]
 pub enum Job {
     Pending(PendingJob),
-    Executing,
     Running(RunningJob),
-    Finishing,
-    #[allow(unused)]
-    Finished(FinishedJob),
+    Successful(SuccessfulJob),
+    Failed(FailedJob),
+    Terminated(TerminatedJob),
 }
-
 impl Job {
-    pub fn new(command: Command, step: StepInfo) -> Job {
-        Job::Pending(PendingJob::new(command, step))
+    pub fn new(command: Command, step: StepInfo) -> Self {
+        Self::Pending(PendingJob::new(command, step))
     }
 
-    pub fn update(&mut self) -> Result<(), JobExecutionError> {
-        match self {
-            Job::Running(running) => running.update_progress(),
-            _ => Ok(()),
-        }
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
     }
 
-    pub fn is_finished(&self) -> bool {
-        match self {
-            Job::Finished(_) => true,
-            _ => false,
-        }
+    pub fn finished(&self) -> bool {
+        matches!(
+            self,
+            Self::Successful(_) | Self::Failed(_) | Self::Terminated(_)
+        )
+    }
+
+    pub fn successful(&self) -> bool {
+        matches!(self, Self::Successful(_))
     }
 
     pub fn failed(&self) -> bool {
-        match self {
-            Job::Finished(finished) => finished.failed(),
-            _ => false,
-        }
+        matches!(self, Self::Failed(_))
     }
 
-    pub fn failed_updates(&self) -> u32 {
+    pub fn step(&self) -> &StepInfo {
         match self {
-            Job::Running(running) => running.failed_updates,
-            _ => 0,
+            Self::Pending(pending) => &pending.step,
+            Self::Running(running) => &running.step,
+            Self::Successful(successful) => &successful.step,
+            Self::Failed(failed) => &failed.step,
+            Self::Terminated(terminated) => &terminated.step,
         }
+    }
+}
+impl From<ExecutedJob> for Job {
+    fn from(executed: ExecutedJob) -> Self {
+        match executed {
+            ExecutedJob::Running(running) => Job::Running(running),
+            ExecutedJob::Finished(successful) => Job::Successful(successful),
+            ExecutedJob::Failed(failed) => Job::Failed(failed),
+        }
+    }
+}
+impl From<FinishedJob> for Job {
+    fn from(finished: FinishedJob) -> Self {
+        match finished {
+            FinishedJob::Successful(successful) => Job::Successful(successful),
+            FinishedJob::Failed(failed) => Job::Failed(failed),
+        }
+    }
+}
+impl From<PendingJob> for Job {
+    fn from(pending: PendingJob) -> Self {
+        Job::Pending(pending)
+    }
+}
+impl From<RunningJob> for Job {
+    fn from(running: RunningJob) -> Self {
+        Job::Running(running)
+    }
+}
+impl From<SuccessfulJob> for Job {
+    fn from(successful: SuccessfulJob) -> Self {
+        Job::Successful(successful)
+    }
+}
+impl From<FailedJob> for Job {
+    fn from(failed: FailedJob) -> Self {
+        Job::Failed(failed)
+    }
+}
+impl From<TerminatedJob> for Job {
+    fn from(terminated: TerminatedJob) -> Self {
+        Job::Terminated(terminated)
     }
 }
 
@@ -101,7 +145,6 @@ pub struct PendingJob {
     command: Command,
     step: StepInfo,
 }
-
 impl PendingJob {
     pub fn new(command: Command, step: StepInfo) -> Self {
         Self { command, step }
@@ -130,64 +173,75 @@ impl PendingJob {
             .map_err(|(path, err)| ExecutionError::OutputExistenceCheck(path, err))
     }
 
-    pub fn finish(self) -> FinishedJob {
-        assert!(self
-            .non_existing_outputs()
-            .is_ok_and(|outputs| outputs.is_empty()));
-        FinishedJob::new_success(self.step)
-    }
-
-    pub fn terminate(self) -> FinishedJob {
-        FinishedJob::new_terminated(self.step)
-    }
-
-    pub fn execute(mut self) -> Result<RunningJob, JobExecutionError> {
-        let non_existing_inputs = self.non_existing_inputs().attach_step_info(&self.step)?;
+    pub fn execute(mut self) -> ExecutedJob {
+        let non_existing_inputs = match self.non_existing_inputs() {
+            Ok(inputs) => inputs,
+            Err(err) => return err.as_failed_job(self.step).into(),
+        };
         if !non_existing_inputs.is_empty() {
-            return Err(ExecutionError::InputExistence {
+            return ExecutionError::InputExistence {
                 input_paths: non_existing_inputs
                     .into_iter()
                     .map(|path| path.to_owned())
                     .collect(),
-            })
-            .attach_step_info(self.step);
+            }
+            .as_failed_job(self.step)
+            .into();
         }
 
-        let non_existing_outputs = self.non_existing_outputs().attach_step_info(&self.step)?;
+        let non_existing_outputs = match self.non_existing_outputs() {
+            Ok(outputs) => outputs,
+            Err(err) => return err.as_failed_job(self.step).into(),
+        };
         if non_existing_outputs.is_empty() {
-            let step = self.step.clone();
-            return Err(ExecutionError::ShouldDirectlyFinish(self)).attach_step_info(step);
+            return SuccessfulJob::new(self.step).into();
         }
 
-        std::fs::create_dir_all(
+        match std::fs::create_dir_all(
             self.step
                 .log
                 .parent()
                 .expect("expected log to be validated as a file path"),
-        )
-        .map_err(|err| ExecutionError::LogFileParentDirectoryCreation(self.step.log.clone(), err))
-        .attach_step_info(&self.step)?;
-        let log_file = File::create(&self.step.log)
-            .map_err(|err| ExecutionError::LogFileCreation(self.step.log.clone(), err))
-            .attach_step_info(&self.step)?;
-        let log_file_stderr = log_file
-            .try_clone()
-            .map_err(|err| ExecutionError::LogFileDuplication(self.step.log.clone(), err))
-            .attach_step_info(&self.step)?;
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                return ExecutionError::LogFileParentDirectoryCreation(self.step.log.clone(), err)
+                    .as_failed_job(self.step)
+                    .into();
+            }
+        };
+        let log_file = match File::create(&self.step.log) {
+            Ok(file) => file,
+            Err(err) => {
+                return ExecutionError::LogFileCreation(self.step.log.clone(), err)
+                    .as_failed_job(self.step)
+                    .into();
+            }
+        };
+        let log_file_stderr = match log_file.try_clone() {
+            Ok(file) => file,
+            Err(err) => {
+                return ExecutionError::LogFileDuplication(self.step.log.clone(), err)
+                    .as_failed_job(self.step)
+                    .into();
+            }
+        };
 
-        let child = self
+        let child = match self
             .command
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_stderr))
             .spawn()
-            .map_err(|err| ExecutionError::Spawn(format!("{:?}", self.command), err))
-            .attach_step_info(&self.step)?;
+        {
+            Ok(child) => child,
+            Err(err) => {
+                return ExecutionError::Spawn(format!("{:?}", self.command), err)
+                    .as_failed_job(self.step)
+                    .into();
+            }
+        };
 
-        Ok(RunningJob::new(child, self.command, self.step))
-    }
-
-    pub fn step_name(&self) -> &str {
-        &self.step.name
+        RunningJob::new(child, self.command, self.step).into()
     }
 }
 
@@ -227,23 +281,21 @@ impl ProgressHandler {
 
 #[derive(Debug)]
 pub struct RunningJob {
-    child: Child,
+    child: RefCell<Child>,
     command: Command,
     progress: Option<ProgressHandler>,
     step: StepInfo,
-    failed_done_polls: u32,
-    failed_updates: u32,
+    warnings: Rc<RefCell<Vec<ExecutionError>>>,
 }
 
 impl RunningJob {
     pub fn new(child: Child, command: Command, step: StepInfo) -> Self {
         Self {
-            child,
+            child: RefCell::new(child),
             command,
             progress: None,
             step,
-            failed_done_polls: 0,
-            failed_updates: 0,
+            warnings: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -256,128 +308,206 @@ impl RunningJob {
 
     pub fn with_progress(
         mut self,
-        build_progress: impl Fn(&Self) -> ProgressBar,
+        mut build_progress: impl FnMut(&Self) -> ProgressBar,
+        only_warn_on_failure: bool,
     ) -> Result<Self, JobExecutionError> {
-        let progress_scanner = self
+        let result = self
             .step
             .progress_scanning
             .as_ref()
             .map(|scanning_info| ProgressScanner::new(scanning_info))
             .transpose()
-            .map_err(|err| ExecutionError::ProgressScanSetup(err))
-            .attach_step_info(&self.step)?;
+            .map_err(|err| ExecutionError::ProgressScanSetup(err));
 
-        self.progress = Some(ProgressHandler::new(
-            progress_scanner,
-            build_progress(&self),
-        ));
+        let progress_scanner = if only_warn_on_failure {
+            result.warn(&self)
+        } else {
+            Some(result.attach_step_info(&self.step)?)
+        };
+
+        if let Some(progress_scanner) = progress_scanner {
+            self.progress = Some(ProgressHandler::new(
+                progress_scanner,
+                build_progress(&self),
+            ));
+        }
 
         Ok(self)
     }
 
-    pub fn done(&mut self) -> Result<bool, JobExecutionError> {
+    pub fn done(&self, only_warn_on_failure: bool) -> Result<bool, JobExecutionError> {
         let result = self
             .child
+            .borrow_mut()
             .try_wait()
             .map_err(|err| ExecutionError::Wait(format!("{:?}", self.command), err))
-            .attach_step_info(&self.step);
-        if result.is_err() {
-            self.failed_done_polls += 1;
-        }
+            .map(|status| status.is_some());
 
-        Ok(result?.is_some())
+        if only_warn_on_failure {
+            Ok(result.warn(self).unwrap_or(false))
+        } else {
+            result.attach_step_info(&self.step)
+        }
     }
 
-    pub fn finish(mut self) -> Result<FinishedJob, JobExecutionError> {
-        let finished_job = match self
-            .child
-            .wait()
-            .map_err(|err| ExecutionError::Wait(format!("{:?}", &self.command), err))
-            .attach_step_info(&self.step)?
-            .code()
-        {
-            Some(0) => FinishedJob::new_success(self.step),
-            Some(code) => FinishedJob::new_failure(
-                self.step,
-                ExecutionError::NonZeroExitCode(format!("{:?}", self.command), code),
-            ),
-            None => FinishedJob::new_failure(
-                self.step,
-                ExecutionError::SignalTermination(format!("{:?}", self.command)),
-            ),
+    pub fn finish(self) -> FinishedJob {
+        let exit_status = match self.child.borrow_mut().wait() {
+            Ok(status) => status,
+            Err(err) => {
+                return ExecutionError::Wait(format!("{:?}", &self.command), err)
+                    .as_failed_job_warnings(self.step, self.warnings)
+                    .into();
+            }
+        };
+
+        let finished_job: FinishedJob = match exit_status.code() {
+            Some(0) => SuccessfulJob::new(self.step).into(),
+            Some(code) => ExecutionError::NonZeroExitCode(format!("{:?}", self.command), code)
+                .as_failed_job_warnings(self.step, self.warnings)
+                .into(),
+            None => ExecutionError::SignalTermination(format!("{:?}", self.command))
+                .as_failed_job_warnings(self.step, self.warnings)
+                .into(),
         };
 
         self.progress.inspect(|progress| progress.finish());
 
-        return Ok(finished_job);
+        return finished_job;
     }
 
-    pub fn terminate(mut self) -> Result<FinishedJob, JobExecutionError> {
+    #[allow(unused)]
+    pub fn terminate(self) -> Result<TerminatedJob, JobExecutionError> {
         self.child
+            .borrow_mut()
             .kill()
             .map_err(|err| ExecutionError::Kill(format!("{:?}", &self.command), err))
             .attach_step_info(&self.step)?;
 
         self.progress.inspect(|progress| progress.finish());
 
-        return Ok(FinishedJob::new_success(self.step));
+        return Ok(TerminatedJob::new(self.step));
     }
 
-    pub fn step_name(&self) -> &str {
-        &self.step.name
+    pub fn step(&self) -> &StepInfo {
+        &self.step
     }
 
-    pub fn update_progress(&mut self) -> Result<(), JobExecutionError> {
+    pub fn progress(mut self, only_warn_on_failure: bool) -> Result<RunningJob, JobExecutionError> {
         let result = match &mut self.progress {
-            Some(progress) => progress.update(&self.step.log).attach_step_info(&self.step),
+            Some(progress) => progress.update(&self.step.log),
             None => Ok(()),
         };
 
-        if result.is_err() {
-            self.failed_updates += 1;
+        if only_warn_on_failure {
+            result.warn(&self);
+            Ok(self)
+        } else {
+            result.attach_step_info(&self.step).map(|_| self)
         }
+    }
 
-        return result;
+    pub fn println<D: Display>(&self, message: D) {
+        match &self.progress {
+            Some(progress) if progress.bar.is_hidden() => {
+                progress.bar.println(format!("{}", message))
+            }
+            Some(progress) => progress.bar.suspend(|| println!("{}", message)),
+            None => println!("{}", message),
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum FinishedJob {
-    Success {
+#[allow(unused)]
+pub struct FailedJob {
+    error: ExecutionError,
+    warnings: Rc<RefCell<Vec<ExecutionError>>>,
+    step: StepInfo,
+}
+impl FailedJob {
+    pub fn new(
         step: StepInfo,
-    },
-    Failure {
         error: ExecutionError,
-        step: StepInfo,
-    },
-    Terminated {
-        step: StepInfo,
-    },
+        warnings: Rc<RefCell<Vec<ExecutionError>>>,
+    ) -> Self {
+        Self {
+            step,
+            error,
+            warnings,
+        }
+    }
 }
 
-impl FinishedJob {
-    pub fn new_success(step: StepInfo) -> Self {
-        Self::Success { step }
+#[derive(Debug)]
+pub struct SuccessfulJob {
+    step: StepInfo,
+}
+impl SuccessfulJob {
+    pub fn new(step: StepInfo) -> Self {
+        Self { step }
+    }
+}
+
+#[derive(Debug)]
+pub struct TerminatedJob {
+    step: StepInfo,
+}
+impl TerminatedJob {
+    #![allow(unused)]
+    pub fn new(step: StepInfo) -> Self {
+        Self { step }
+    }
+}
+
+pub enum ExecutedJob {
+    Running(RunningJob),
+    Finished(SuccessfulJob),
+    Failed(FailedJob),
+}
+impl ExecutedJob {
+    #![allow(unused)]
+    pub fn is_running(&self) -> bool {
+        matches!(self, ExecutedJob::Running(_))
     }
 
-    pub fn new_failure(step: StepInfo, error: ExecutionError) -> Self {
-        Self::Failure { step, error }
+    pub fn map_running<F>(self, f: F) -> Result<ExecutedJob, JobExecutionError>
+    where
+        F: FnOnce(RunningJob) -> Result<RunningJob, JobExecutionError>,
+    {
+        match self {
+            ExecutedJob::Running(running) => Ok(Self::Running(f(running)?)),
+            job => Ok(job),
+        }
     }
-
-    pub fn new_terminated(step: StepInfo) -> Self {
-        Self::Terminated { step }
+}
+impl From<FailedJob> for ExecutedJob {
+    fn from(failed: FailedJob) -> Self {
+        ExecutedJob::Failed(failed)
     }
-
-    pub fn failed(&self) -> bool {
-        matches!(self, FinishedJob::Failure { .. })
+}
+impl From<SuccessfulJob> for ExecutedJob {
+    fn from(successful: SuccessfulJob) -> Self {
+        ExecutedJob::Finished(successful)
     }
-
-    pub fn success(&self) -> bool {
-        matches!(self, FinishedJob::Success { .. })
+}
+impl From<RunningJob> for ExecutedJob {
+    fn from(running: RunningJob) -> Self {
+        ExecutedJob::Running(running)
     }
+}
 
-    pub fn terminated(&self) -> bool {
-        matches!(self, FinishedJob::Terminated { .. })
+pub enum FinishedJob {
+    Successful(SuccessfulJob),
+    Failed(FailedJob),
+}
+impl From<SuccessfulJob> for FinishedJob {
+    fn from(successful: SuccessfulJob) -> Self {
+        FinishedJob::Successful(successful)
+    }
+}
+impl From<FailedJob> for FinishedJob {
+    fn from(value: FailedJob) -> Self {
+        FinishedJob::Failed(value)
     }
 }
 
@@ -389,14 +519,14 @@ pub enum ExecutionError {
     #[error("failed to check for the existence of {0}\n{1}")]
     InputExistenceCheck(PathBuf, std::io::Error),
 
-    #[error("the following inputs do not exist:\n\t{}", input_paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join("\n\t"))]
+    #[error(
+        "the following inputs do not exist:\n\t{}",
+        input_paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join("\n\t")
+    )]
     InputExistence { input_paths: Vec<PathBuf> },
 
     #[error("failed to check for the existence of {0}\n{1}")]
     OutputExistenceCheck(PathBuf, std::io::Error),
-
-    #[error("the job should be finished directly")]
-    ShouldDirectlyFinish(PendingJob),
 
     #[error("failed to create the parent directory for the specified log file `{0}`\n{1}")]
     LogFileParentDirectoryCreation(PathBuf, std::io::Error),
@@ -410,6 +540,7 @@ pub enum ExecutionError {
     #[error("failed to poll `{0}`\n{1}")]
     Wait(String, std::io::Error),
 
+    #[allow(unused)]
     #[error("failed to kill `{0}`\n{1}")]
     Kill(String, std::io::Error),
 
@@ -427,11 +558,17 @@ pub enum ExecutionError {
 
     #[error("failed to read progress from `{0}`\n{1}")]
     ProgressScan(PathBuf, ProgressScanError),
+
+    #[error(
+        "one or more parent jobs failed:\n\t{}",
+        parents.into_iter().map(|step| step.name.as_str()).collect::<Vec<_>>().join("\n\t"))
+    ]
+    ParentsFailed { parents: Vec<StepInfo> },
 }
 
 #[derive(Debug, thiserror::Error, Diagnostic)]
 #[error(
-    "failed to execute `{name}`\n\
+    "failure while executing `{name}`\n\
     {error}\n\
     check {log} or execute nixflow with `--inspect {name}` to inspect the job output",
     name = step.name,
@@ -441,6 +578,30 @@ pub enum ExecutionError {
 pub struct JobExecutionError {
     pub step: StepInfo,
     pub error: ExecutionError,
+}
+
+pub trait AsFailedJob {
+    fn as_failed_job<S: Into<StepInfo>>(self, step: S) -> FailedJob;
+
+    fn as_failed_job_warnings<S: Into<StepInfo>>(
+        self,
+        step: S,
+        warnings: Rc<RefCell<Vec<ExecutionError>>>,
+    ) -> FailedJob;
+}
+
+impl AsFailedJob for ExecutionError {
+    fn as_failed_job<S: Into<StepInfo>>(self, step: S) -> FailedJob {
+        FailedJob::new(step.into(), self, Rc::default())
+    }
+
+    fn as_failed_job_warnings<S: Into<StepInfo>>(
+        self,
+        step: S,
+        warnings: Rc<RefCell<Vec<ExecutionError>>>,
+    ) -> FailedJob {
+        FailedJob::new(step.into(), self, warnings)
+    }
 }
 
 pub trait AttachStepInfo<T> {
@@ -453,5 +614,28 @@ impl<T> AttachStepInfo<T> for Result<T, ExecutionError> {
             step: step.into(),
             error,
         })
+    }
+}
+
+trait Warn<T> {
+    fn warn(self, job: &RunningJob) -> Option<T>;
+}
+
+impl<T> Warn<T> for Result<T, ExecutionError> {
+    fn warn(self, job: &RunningJob) -> Option<T> {
+        let err = match self {
+            Ok(value) => return Some(value),
+            Err(err) => err,
+        };
+
+        if job.warnings.borrow().len() == 0 {
+            job.println(format!(
+                "warning: failed to update the progress of {} at least once",
+                job.step.name
+            ));
+        }
+        job.warnings.borrow_mut().push(err);
+
+        return None;
     }
 }

@@ -71,6 +71,24 @@ pub struct StepInfo {
     progress_scanning: Option<ProgressScanningInfo>,
 }
 
+impl Step {
+    pub fn info(&self) -> StepInfo {
+        StepInfo::new(
+            self.name.clone(),
+            self.inputs
+                .values()
+                .flat_map(|input_list| input_list.inputs.iter().map(|input| input.path.clone()))
+                .collect(),
+            self.outputs
+                .values()
+                .flat_map(|output_list| output_list.outputs.iter().map(|output| output.path.clone()))
+                .collect(),
+            self.log.clone(),
+            self.progress_scanning.clone(),
+        )
+    }
+}
+
 impl StepInfo {
     pub fn new(
         name: String,
@@ -89,8 +107,8 @@ impl StepInfo {
     }
 }
 
-impl Into<StepInfo> for &StepInfo {
-    fn into(self) -> StepInfo {
-        self.clone()
+impl From<&StepInfo> for StepInfo {
+    fn from(value: &StepInfo) -> Self {
+        value.clone()
     }
 }

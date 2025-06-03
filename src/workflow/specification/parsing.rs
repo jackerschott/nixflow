@@ -1,6 +1,6 @@
-use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
+use camino::Utf8PathBuf as PathBuf;
 use miette::{Context, IntoDiagnostic, SourceOffset};
-use serde::{de::value::MapAccessDeserializer, Deserialize};
+use serde::{Deserialize, de::value::MapAccessDeserializer};
 use serde_with::DeserializeAs;
 
 use super::TargetItem;
@@ -57,10 +57,8 @@ pub struct ParsingError {
 }
 
 pub trait WithSourceIndication<T> {
-    fn with_source_indication<S: Into<String>>(
-        self,
-        input: S,
-    ) -> miette::Result<miette::Result<T>>;
+    fn with_source_indication<S: Into<String>>(self, input: S)
+    -> miette::Result<miette::Result<T>>;
 }
 
 impl<T> WithSourceIndication<T> for serde_json::Result<T> {
