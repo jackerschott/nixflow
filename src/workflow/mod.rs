@@ -5,7 +5,7 @@ use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCom
 
 pub mod graph;
 pub mod specification;
-pub mod step;
+pub mod job;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {

@@ -6,14 +6,11 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
 };
 
-use crate::{
-    nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions},
-    workflow::step::Step,
-};
+use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
 
 use super::{
-    specification::WorkflowSpecification,
-    step::execution::{AsFailedJob, ExecutionError, Job, JobExecutionError},
+    job::{AsFailedJob, AttachStepInfo, ExecutionError, Job, JobExecutionError, Warn},
+    specification::{Step, WorkflowSpecification, progress::ProgressScanner},
 };
 
 type JobCount = u32;
@@ -71,7 +68,9 @@ impl JobGraph {
                 NixRunCommandOptions::default().unbuffered(),
             );
 
-            let id = graph.add_node(step.executor.build_job(&run_command, step.info()).into());
+            let id = graph.add_node(
+                Job::new(step.executor.execution_command(&run_command), step.info()).into(),
+            );
             for (_, input_list) in step.inputs.into_iter() {
                 for input in input_list.inputs.into_iter() {
                     let parent_id =
@@ -264,4 +263,52 @@ pub fn add_job_progress<S: Into<String>>(
 
     state.job_execution_index += 1;
     state.progress.add(progress)
+}
+
+pub struct JobWithProgress {
+    job: Job,
+    scanner: Option<ProgressScanner>,
+    bar: ProgressBar,
+}
+
+trait WithProgress {
+    fn with_progress(
+        mut self,
+        only_warn_on_failure: bool,
+    ) -> Result<JobWithProgress, JobExecutionError>;
+}
+
+impl WithProgress for Job {
+    fn with_progress(
+        mut self,
+        only_warn_on_failure: bool,
+    ) -> Result<JobWithProgress, JobExecutionError> {
+        let result = self
+            .step()
+            .progress_scanning
+            .as_ref()
+            .map(|scanning_info| ProgressScanner::new(scanning_info))
+            .transpose()
+            .map_err(|err| ExecutionError::ProgressScanSetup(err));
+
+        let progress_scanner = if only_warn_on_failure {
+            result.warn(&self)
+        } else {
+            Some(result.attach_step_info(self.step())?)
+        };
+
+        if let Some(progress_scanner) = progress_scanner {
+            Ok(JobWithProgress {
+                job: self,
+                scanner: progress_scanner,
+                bar: ProgressBar::new(3),
+            })
+        } else {
+            Ok(JobWithProgress {
+                job: self,
+                scanner: None,
+                bar: ProgressBar::new(3),
+            })
+        }
+    }
 }

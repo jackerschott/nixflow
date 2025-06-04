@@ -1,59 +1,11 @@
+use std::{cell::RefCell, fmt::Display, fs::File, process::{Child, Command, Stdio}, rc::Rc};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
-use default::DefaultExecutor;
 use indicatif::ProgressBar;
 use miette::Diagnostic;
-use serde::Deserialize;
-use slurm::SlurmExecutor;
-use std::{
-    cell::RefCell,
-    fmt::Display,
-    fs::File,
-    process::{Child, Command, Stdio},
-    rc::Rc,
-};
 
-use super::{
-    StepInfo,
-    progress::{ProgressScanError, ProgressScanner},
-};
-use crate::nix_environment::NixRunCommand;
+use super::specification::{progress::{ProgressScanError, ProgressScanner}, StepInfo};
 
-mod default;
-mod slurm;
-
-#[derive(Debug, Deserialize)]
-pub enum Executor {
-    Default(DefaultExecutor),
-    Slurm(SlurmExecutor),
-}
-
-impl Executor {
-    fn execution_command<'s>(&'s self, target: &Box<dyn NixRunCommand>) -> Command {
-        match self {
-            Executor::Default(default) => default.execution_command(target),
-            Executor::Slurm(slurm) => slurm.execution_command(target),
-        }
-    }
-
-    pub fn build_job(&self, command: &Box<dyn NixRunCommand>, step: StepInfo) -> Job {
-        Job::new(self.execution_command(&command), step)
-    }
-}
-
-impl Default for Executor {
-    fn default() -> Self {
-        Executor::Default(DefaultExecutor {})
-    }
-}
-
-impl std::fmt::Display for Executor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Executor::Default(default) => write!(f, "{default}"),
-            Executor::Slurm(slurm) => write!(f, "{slurm}"),
-        }
-    }
-}
+pub mod execution;
 
 #[derive(Debug)]
 pub enum Job {
@@ -617,12 +569,12 @@ impl<T> AttachStepInfo<T> for Result<T, ExecutionError> {
     }
 }
 
-trait Warn<T> {
-    fn warn(self, job: &RunningJob) -> Option<T>;
+pub trait Warn<T> {
+    fn warn(self, job: &Job) -> Option<T>;
 }
 
 impl<T> Warn<T> for Result<T, ExecutionError> {
-    fn warn(self, job: &RunningJob) -> Option<T> {
+    fn warn(self, job: &Job) -> Option<T> {
         let err = match self {
             Ok(value) => return Some(value),
             Err(err) => err,
