@@ -12,7 +12,7 @@ pub struct ProgressScanningInfo {
     pub indicator_regex_pattern: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ProgressScanner {
     info: ProgressScanningInfo,
     indicator_regex: Regex,
@@ -68,7 +68,7 @@ impl ProgressScanner {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ProgressScanError {
     #[error("{0}")]
     CompilationFailure(#[from] regex::Error),

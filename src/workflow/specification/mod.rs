@@ -66,16 +66,6 @@ pub struct Step {
     #[allow(unused)]
     run_binary_path: PathBuf,
 }
-
-#[derive(Clone, Debug)]
-pub struct StepInfo {
-    pub name: String,
-    pub inputs: Vec<PathBuf>,
-    pub outputs: Vec<PathBuf>,
-    pub log: PathBuf,
-    pub progress_scanning: Option<ProgressScanningInfo>,
-}
-
 impl Step {
     pub fn info(&self) -> StepInfo {
         StepInfo::new(
@@ -93,6 +83,21 @@ impl Step {
         )
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct StepInfo {
+    pub name: String,
+    pub inputs: Vec<PathBuf>,
+    pub outputs: Vec<PathBuf>,
+    pub log: PathBuf,
+    pub progress_scanning: Option<ProgressScanningInfo>,
+}
+impl StepInfo {
+    pub fn progress_max(&self) -> Option<u32> {
+        self.progress_scanning.as_ref().map(|info| info.indicator_max)
+    }
+}
+
 
 impl StepInfo {
     pub fn new(

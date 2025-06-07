@@ -4,13 +4,12 @@ use miette::{Context, IntoDiagnostic, Result};
 use nix_environment::build_environment;
 use serde::Deserialize;
 use workflow::{
-    generate_specification_string,
-    graph::{GraphExecutionOptions, JobGraph, execute_job_graph},
-    specification::WorkflowSpecification,
+    generate_specification_string, graph::{execution::{execute_job_graph, GraphExecutionOptions}, JobGraph}, specification::WorkflowSpecification,
 };
 
 mod commands;
 mod nix_environment;
+mod utils;
 mod workflow;
 
 #[derive(Deserialize)]
@@ -27,6 +26,12 @@ struct Cli {
 
     #[arg(long)]
     force_nix_portable_usage: bool,
+
+    #[arg(short = 'i', long)]
+    inspect: Option<String>,
+
+    #[arg(short = 'k', long)]
+    keep_going: bool,
 }
 
 fn main() -> Result<()> {
@@ -68,14 +73,16 @@ fn main() -> Result<()> {
         &cli.workflow_flake_path,
     );
 
-    execute_job_graph(
+    let job_graph = execute_job_graph(
         job_graph,
         GraphExecutionOptions {
             max_parallel_jobs: 3,
-            only_warn_job_update_failures: false,
-            keep_going: false,
+            keep_going: cli.keep_going,
+            inspection_target: cli.inspect,
         },
-    )?;
+    ).context("failed to execute job graph")?;
+
+    job_graph.print_report();
 
     Ok(())
 }
