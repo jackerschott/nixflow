@@ -96,6 +96,11 @@ impl JobGraph {
         self.0.node_indices()
     }
 
+    pub fn jobs(&self) -> impl Iterator<Item = &Job> {
+        self.0
+            .node_weights()
+            .map(|job| job.as_ref().expect("never called in main execution loop"))
+    }
 
     pub fn job_count(&self) -> u32 {
         self.0.node_count() as u32

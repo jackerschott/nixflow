@@ -50,6 +50,8 @@ pub fn execute_job_graph(
         }
     }
 
+    graph.jobs().for_each(|job| job.cleanup());
+
     return Ok(graph);
 }
 
@@ -87,7 +89,7 @@ pub fn update_job(
                 .map(|parent| parent.step().clone())
                 .collect();
 
-            Err(ExecutionError::ParentsFailed { parents }.as_failed_job(job.report()))
+            Err(ExecutionError::ParentsFailed { parents }.as_failed_job(job.report(), None))
         }
         job @ Job::Pending(_) => Ok(job),
 

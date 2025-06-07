@@ -32,6 +32,9 @@ struct Cli {
 
     #[arg(short = 'k', long)]
     keep_going: bool,
+
+    #[arg(name = "jobs", short = 'j', long)]
+    max_parallel_jobs: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -76,7 +79,7 @@ fn main() -> Result<()> {
     let job_graph = execute_job_graph(
         job_graph,
         GraphExecutionOptions {
-            max_parallel_jobs: 3,
+            max_parallel_jobs: cli.max_parallel_jobs.unwrap_or(1),
             keep_going: cli.keep_going,
             inspection_target: cli.inspect,
         },
