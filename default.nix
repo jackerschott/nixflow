@@ -11,6 +11,11 @@ in {
             parentStep = step;
         };
 
+        executors = {
+            default = { id = "default"; };
+            slurm = params: { id = "slurm"; } // params;
+        };
+
         pythonScript = arguments: script: pkgs.writers.writePython3 "run" arguments script;
     };
 
@@ -25,15 +30,25 @@ in {
                 else { ${step.name} = step.run; }) steps)
             lib.mergeAttrsList
         ];
-    in {
-        makeStepsPrinter = workflowSpecificationPath:
+    in rec {
+        makeStepsPrinterProfile = workflowSpecificationPath: profile:
             (workflow: pkgs.writers.writeBashBin "steps" '' jq . <<< '${builtins.toJSON workflow}' '')
-            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib; });
+            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib profile; });
 
-        makeStepRunners = workflowSpecificationPath: {system}: lib.pipe
-            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib; }) [
+        makeStepsPrinter = workflowSpecificationPath: profiles: lib.pipe profiles [
+            (profiles: map (profile: { ${profile} = makeStepsPrinterProfile workflowSpecificationPath profile; }) profiles)
+            lib.mergeAttrsList
+        ];
+
+        makeStepRunnersProfile = workflowSpecificationPath: profile: {system}: lib.pipe
+            (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib profile; }) [
             collectStepRunners
             (runners: lib.mapAttrs (name: runner: { type = "app"; program = "${runner}"; }) runners)
+        ];
+
+        makeStepRunners = workflowSpecificationPath: profiles: lib.pipe profiles [
+            (profiles: map (profile: { ${profile} = makeStepRunnersProfile workflowSpecificationPath profile; }) profiles)
+            lib.mergeAttrsList
         ];
     };
 }
