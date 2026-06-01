@@ -43,11 +43,11 @@ in {
         makeStepRunnersProfile = workflowSpecificationPath: profile: {system}: lib.pipe
             (import workflowSpecificationPath { nixflow = self.preamble; inherit pkgs lib profile; }) [
             collectStepRunners
-            (runners: lib.mapAttrs (name: runner: { type = "app"; program = "${runner}"; }) runners)
+            (runners: lib.mapAttrs (name: runner: { type = "app"; inherit name; program = "${runner}"; derivation = runner; }) runners)
         ];
 
-        makeStepRunners = workflowSpecificationPath: profiles: lib.pipe profiles [
-            (profiles: map (profile: { ${profile} = makeStepRunnersProfile workflowSpecificationPath profile; }) profiles)
+        makeStepRunners = workflowSpecificationPath: profiles: {system}: lib.pipe profiles [
+            (profiles: map (profile: { ${profile} = makeStepRunnersProfile workflowSpecificationPath profile { inherit system; }; }) profiles)
             lib.mergeAttrsList
         ];
     };

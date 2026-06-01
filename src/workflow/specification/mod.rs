@@ -5,11 +5,11 @@ use miette::{Context, IntoDiagnostic};
 use parsing::{TargetList, WithSourceIndication};
 use serde::Deserialize;
 use serde_json::Value;
-use serde_with::{serde_as, OneOrMany};
+use serde_with::{OneOrMany, serde_as};
 
 use progress::ProgressScanningInfo;
 
-use super::job::execution::Executor;
+use super::job::execution::ExecutionOptions;
 
 mod parsing;
 pub mod progress;
@@ -55,7 +55,7 @@ pub struct Step {
     pub outputs: HashMap<String, OutputList>,
 
     #[serde(default)]
-    pub executor: Executor,
+    pub execution: ExecutionOptions,
 
     pub log: PathBuf,
 
@@ -76,7 +76,9 @@ impl Step {
                 .collect(),
             self.outputs
                 .values()
-                .flat_map(|output_list| output_list.outputs.iter().map(|output| output.path.clone()))
+                .flat_map(|output_list| {
+                    output_list.outputs.iter().map(|output| output.path.clone())
+                })
                 .collect(),
             self.log.clone(),
             self.progress_scanning.clone(),
@@ -94,10 +96,11 @@ pub struct StepInfo {
 }
 impl StepInfo {
     pub fn progress_max(&self) -> Option<u32> {
-        self.progress_scanning.as_ref().map(|info| info.indicator_max)
+        self.progress_scanning
+            .as_ref()
+            .map(|info| info.indicator_max)
     }
 }
-
 
 impl StepInfo {
     pub fn new(

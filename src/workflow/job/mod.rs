@@ -1,12 +1,17 @@
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use derive_more::Debug;
+use execution::{
+    ExecutionError, ExecutionMethod, JobExecutionChild, JobExecutionCommand, JobExecutionError,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::Diagnostic;
 use std::{
-    cell::RefCell,
-    fs::{File, OpenOptions},
+    error::Error,
+    fmt::Display,
+    fs::OpenOptions,
     io::{self, BufRead, BufReader, Write},
-    process::{Child, Command, Stdio},
+    process::Command,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -34,7 +39,7 @@ pub enum Job {
     Terminated(TerminatedJob),
 }
 impl Job {
-    pub fn new(command: Command, step: StepInfo) -> Self {
+    pub fn new(command: Box<dyn JobExecutionCommand>, step: StepInfo) -> Self {
         Self::Pending(PendingJob::new(command, step))
     }
 
@@ -120,11 +125,11 @@ impl From<FinishedJob> for Job {
 
 #[derive(Debug)]
 pub struct PendingJob {
-    command: Command,
+    command: Box<dyn JobExecutionCommand>,
     pub step: StepInfo,
 }
 impl PendingJob {
-    pub fn new(command: Command, step: StepInfo) -> Self {
+    pub fn new(command: Box<dyn JobExecutionCommand>, step: StepInfo) -> Self {
         Self { command, step }
     }
 
@@ -141,14 +146,14 @@ impl PendingJob {
             .collect()
     }
 
-    fn non_existing_inputs(&self) -> Result<Vec<&Path>, ExecutionError> {
+    fn non_existing_inputs(&self) -> Result<Vec<&Path>, JobError> {
         self.non_existing_associated_paths(&self.step.inputs)
-            .map_err(|(path, err)| ExecutionError::InputExistenceCheck(path, err.into()))
+            .map_err(|(path, err)| JobError::InputExistenceCheck(path, err.into()))
     }
 
-    fn non_existing_outputs(&self) -> Result<Vec<&Path>, ExecutionError> {
+    fn non_existing_outputs(&self) -> Result<Vec<&Path>, JobError> {
         self.non_existing_associated_paths(&self.step.outputs)
-            .map_err(|(path, err)| ExecutionError::OutputExistenceCheck(path, err.into()))
+            .map_err(|(path, err)| JobError::OutputExistenceCheck(path, err.into()))
     }
 
     pub fn terminate(self) -> TerminatedJob {
@@ -162,7 +167,7 @@ impl PendingJob {
     }
 
     pub fn execute(
-        mut self,
+        self,
         progress: &MultiProgress,
         progress_style: JobProgressStyle,
         prefer_warnings: bool,
@@ -172,7 +177,7 @@ impl PendingJob {
             .non_existing_inputs()
             .map_err(|err| FailedJob::new(err, self.report(), None))?;
         if !non_existing_inputs.is_empty() {
-            return Err(ExecutionError::InputExistence {
+            return Err(JobError::InputExistence {
                 input_paths: non_existing_inputs
                     .into_iter()
                     .map(|path| path.to_owned())
@@ -202,34 +207,19 @@ impl PendingJob {
                 .expect("expected log to be validated as a file path"),
         )
         .map_err(|err| {
-            ExecutionError::LogFileParentDirectoryCreation(self.step.log.clone(), err.into())
+            JobError::LogFileParentDirectoryCreation(self.step.log.clone(), err.into())
                 .as_failed_job(self.report(), None)
         })?;
-        let log_file = File::create(&self.step.log).map_err(|err| {
-            ExecutionError::LogFileCreation(self.step.log.clone(), err.into())
-                .as_failed_job(self.report(), None)
-        })?;
-        let command = if !inspect {
-            let log_file_stderr = log_file.try_clone().map_err(|err| {
-                ExecutionError::LogFileDuplication(self.step.log.clone(), err.into())
-                    .as_failed_job(self.report(), None)
-            })?;
 
-            self.command
-                .stdout(Stdio::from(log_file))
-                .stderr(Stdio::from(log_file_stderr))
-        } else {
-            &mut self.command.stdout(Stdio::piped()).stderr(Stdio::piped())
-        };
-
-        let child = command.spawn().map_err(|err| {
-            ExecutionError::Spawn(format!("{:?}", self.command), err.into())
-                .as_failed_job(self.report(), None)
-        })?;
+        let report = self.report();
+        let child = self
+            .command
+            .spawn()
+            .map_err(|err| err.into())
+            .map_err(|err: JobError| err.as_failed_job(report, None))?;
 
         match RunningJob::new(
             child,
-            self.command,
             self.step.clone(),
             progress,
             progress_style,
@@ -300,17 +290,17 @@ impl ProgressHandler {
         }
     }
 
-    fn update<P: AsRef<Path>>(&mut self, log: &P) -> Result<(), ExecutionError> {
+    fn update<P: AsRef<Path>>(&mut self, log: &P) -> Result<(), JobError> {
         match &mut self.scanner {
             None => self.bar.tick(),
             Some(scan_info) => {
                 let log_contents = std::fs::read_to_string(log.as_ref()).map_err(|err| {
-                    ExecutionError::ProgressLogRead(log.as_ref().to_owned(), err.into())
+                    JobError::ProgressLogRead(log.as_ref().to_owned(), err.into())
                 })?;
 
                 let progress = scan_info
                     .read_progress(log_contents)
-                    .map_err(|err| ExecutionError::ProgressScan(log.as_ref().to_owned(), err))?;
+                    .map_err(|err| JobError::ProgressScan(log.as_ref().to_owned(), err))?;
 
                 self.bar.set_position(progress as u64);
             }
@@ -328,42 +318,11 @@ impl ProgressHandler {
 #[derive(Debug)]
 struct JobOutputInspector {
     stop: Arc<AtomicBool>,
-    stdout_handle: JoinHandle<Result<(), ExecutionError>>,
-    stderr_handle: JoinHandle<Result<(), ExecutionError>>,
+    stdout_handle: JoinHandle<Result<(), JobError>>,
+    stderr_handle: JoinHandle<Result<(), JobError>>,
 }
 impl JobOutputInspector {
-    fn write<R: io::Read + Send + 'static>(
-        reader: BufReader<R>,
-        progress: &MultiProgress,
-        log: PathBuf,
-        stop: &Arc<AtomicBool>,
-    ) -> JoinHandle<Result<(), ExecutionError>> {
-        let progress = progress.clone();
-        let stop_stdout = stop.clone();
-        thread::spawn(move || -> Result<_, ExecutionError> {
-            for line in reader.lines() {
-                if stop_stdout.load(Ordering::Acquire) {
-                    break;
-                }
-
-                let line = line.map_err(|err| ExecutionError::InspectionOutputRead(err.into()))?;
-                progress
-                    .println(&line)
-                    .map_err(|err| ExecutionError::InspectionOutputPrint(err.into()))?;
-
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log)
-                    .map_err(|err| ExecutionError::InspectionOutputWriteToLog(err.into()))?
-                    .write_all(format!("{line}\n").as_bytes())
-                    .map_err(|err| ExecutionError::InspectionOutputWriteToLog(err.into()))?;
-            }
-            Ok(())
-        })
-    }
-
-    fn new<P: Into<PathBuf>>(child: &mut Child, progress: &MultiProgress, log: P) -> Self {
+    fn new<P: Into<PathBuf>>(child: &JobExecutionChild, progress: &MultiProgress, log: P) -> Self {
         let stdout = BufReader::new(
             child
                 .stdout
@@ -386,7 +345,38 @@ impl JobOutputInspector {
         }
     }
 
-    fn join(self) -> Result<(), ExecutionError> {
+    fn write<R: io::Read + Send + 'static>(
+        reader: BufReader<R>,
+        progress: &MultiProgress,
+        log: PathBuf,
+        stop: &Arc<AtomicBool>,
+    ) -> JoinHandle<Result<(), JobError>> {
+        let progress = progress.clone();
+        let stop_stdout = stop.clone();
+        thread::spawn(move || -> Result<_, JobError> {
+            for line in reader.lines() {
+                if stop_stdout.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let line = line.map_err(|err| JobError::InspectionOutputRead(err.into()))?;
+                progress
+                    .println(&line)
+                    .map_err(|err| JobError::InspectionOutputPrint(err.into()))?;
+
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .map_err(|err| JobError::InspectionOutputWriteToLog(err.into()))?
+                    .write_all(format!("{line}\n").as_bytes())
+                    .map_err(|err| JobError::InspectionOutputWriteToLog(err.into()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn join(self) -> Result<(), JobError> {
         self.stop.store(true, Ordering::Relaxed);
         self.stdout_handle.join_or_panic()?;
         self.stderr_handle.join_or_panic()?;
@@ -397,8 +387,7 @@ impl JobOutputInspector {
 
 #[derive(Debug)]
 pub struct RunningJob {
-    child: RefCell<Child>,
-    command: Command,
+    child: Box<dyn JobExecutionChild>,
     pub progress: ProgressHandler,
     error_catcher: ErrorCatcher,
     step: StepInfo,
@@ -407,14 +396,13 @@ pub struct RunningJob {
 
 impl RunningJob {
     pub fn new(
-        mut child: Child,
-        command: Command,
+        child: Box<dyn JobExecutionChild>,
         step: StepInfo,
         progress: &MultiProgress,
         progress_style: JobProgressStyle,
         prefer_warnings: bool,
         inspect: bool,
-    ) -> Result<Self, ExecutionError> {
+    ) -> Result<Self, JobError> {
         let mut error_catcher = ErrorCatcher::new(!prefer_warnings);
 
         let progress_scanner = step
@@ -422,7 +410,7 @@ impl RunningJob {
             .as_ref()
             .map(|info| ProgressScanner::new(&info))
             .transpose()
-            .map_err(|err| ExecutionError::ProgressScanSetup(err))
+            .map_err(|err| JobError::ProgressScanSetup(err))
             .try_catch(&mut error_catcher)?
             .unwrap_or(None);
 
@@ -435,17 +423,15 @@ impl RunningJob {
         progress_handler.bar = progress.add(progress_handler.bar);
 
         Ok(Self {
-            output_inspector: inspect
-                .then(|| JobOutputInspector::new(&mut child, progress, &step.log)),
-            child: RefCell::new(child),
-            command,
+            output_inspector: inspect.then(|| JobOutputInspector::new(&child, progress, &step.log)),
+            child,
             progress: progress_handler,
             step,
             error_catcher,
         })
     }
 
-    pub fn cleanup_fail(&mut self) -> Result<(), ExecutionError> {
+    pub fn cleanup_fail(&mut self) -> Result<(), JobError> {
         self.progress.set_as_failed();
         self.output_inspector
             .take()
@@ -454,7 +440,7 @@ impl RunningJob {
         Ok(())
     }
 
-    pub fn cleanup_success(&mut self) -> Result<(), ExecutionError> {
+    pub fn cleanup_success(&mut self) -> Result<(), JobError> {
         self.output_inspector
             .take()
             .map(|inspector| inspector.join())
@@ -468,7 +454,7 @@ impl RunningJob {
             .borrow_mut()
             .try_wait()
             .map_err(|err| {
-                ExecutionError::Wait(format!("{:?}", self.command), err.into())
+                JobError::Wait(format!("{:?}", self.command), err.into())
                     .as_failed_job(self.report(), Some(self.progress.bar.clone()))
             })
             .map(|status| status.is_some());
@@ -483,7 +469,7 @@ impl RunningJob {
 
     pub fn finish(mut self) -> Result<SuccessfulJob, FailedJob> {
         let exit_status = self.child.borrow_mut().wait().map_err(|err| {
-            ExecutionError::Wait(format!("{:?}", &self.command), err.into())
+            JobError::Wait(format!("{:?}", &self.command), err.into())
                 .as_failed_job(self.report(), Some(self.progress.bar.clone()))
         })?;
 
@@ -506,17 +492,15 @@ impl RunningJob {
                 // we only care about the first error
                 let _ = self.cleanup_fail();
                 Err(
-                    ExecutionError::NonZeroExitCode(format!("{:?}", self.command), code)
+                    JobError::NonZeroExitCode(format!("{:?}", self.command), code)
                         .as_failed_job(self.report(), Some(self.progress.bar)),
                 )
             }
             None => {
                 // we only care about the first error
                 let _ = self.cleanup_fail();
-                Err(
-                    ExecutionError::SignalTermination(format!("{:?}", self.command))
-                        .as_failed_job(self.report(), Some(self.progress.bar)),
-                )
+                Err(JobError::SignalTermination(format!("{:?}", self.command))
+                    .as_failed_job(self.report(), Some(self.progress.bar)))
             }
         }
     }
@@ -530,10 +514,8 @@ impl RunningJob {
                 },
                 Some(self.progress.bar.clone()),
             )),
-            Err(err) => Err(
-                ExecutionError::Kill(format!("{:?}", &self.command), err.into())
-                    .as_failed_job(self.report(), Some(self.progress.bar.clone())),
-            ),
+            Err(err) => Err(JobError::Kill(format!("{:?}", &self.command), err.into())
+                .as_failed_job(self.report(), Some(self.progress.bar.clone()))),
         };
 
         if result.is_ok() {
@@ -570,7 +552,7 @@ impl RunningJob {
 
 #[derive(Clone, Debug)]
 pub struct JobReport {
-    warnings: Vec<ExecutionError>,
+    warnings: Vec<JobError>,
     step: StepInfo,
 }
 
@@ -582,12 +564,12 @@ pub struct JobReport {
 )]
 #[diagnostic(help("check {log} or execute nixflow with `--inspect {name}` (if not done so already) to inspect the job output", name = report.step.name, log = report.step.log))]
 pub struct FailedJob {
-    error: ExecutionError,
+    error: JobError,
     report: JobReport,
     progress: Option<ProgressBar>,
 }
 impl FailedJob {
-    pub fn new(error: ExecutionError, report: JobReport, progress: Option<ProgressBar>) -> Self {
+    pub fn new(error: JobError, report: JobReport, progress: Option<ProgressBar>) -> Self {
         Self {
             error,
             report,
@@ -661,9 +643,9 @@ impl From<FailedJob> for FinishedJob {
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
-pub enum ExecutionError {
-    #[error("failed to spawn `{0}`\n{1}")]
-    Spawn(String, IoError),
+pub enum JobError {
+    #[error("usage of the `{0}` executor which was not provided in the job specification")]
+    UnprovidedExecutorUsage(ExecutionMethod),
 
     #[error("failed to check for the existence of {0}\n{1}")]
     InputExistenceCheck(PathBuf, IoError),
@@ -679,12 +661,6 @@ pub enum ExecutionError {
 
     #[error("failed to create the parent directory for the specified log file `{0}`\n{1}")]
     LogFileParentDirectoryCreation(PathBuf, IoError),
-
-    #[error("failed to create the log file `{0}`")]
-    LogFileCreation(PathBuf, IoError),
-
-    #[error("failed to duplicate log file handle to `{0}`\n{1}")]
-    LogFileDuplication(PathBuf, IoError),
 
     #[error("failed to poll `{0}`\n{1}")]
     Wait(String, IoError),
@@ -715,20 +691,27 @@ pub enum ExecutionError {
     ParentsFailed { parents: Vec<StepInfo> },
 
     #[error("failed to read a line from stdout/stderr during job output inspection")]
-    InspectionOutputRead(IoError),
+    InspectionOutputRead(#[source] IoError),
 
     #[error("failed to print a line to stdout during job output inspection")]
-    InspectionOutputPrint(IoError),
+    InspectionOutputPrint(#[source] IoError),
 
     #[error("failed to write a line to the job log during job output inspection")]
-    InspectionOutputWriteToLog(IoError),
+    InspectionOutputWriteToLog(#[source] IoError),
+
+    #[error("failed to execute\n{0}")]
+    JobExecution(
+        #[source]
+        #[from]
+        JobExecutionError,
+    ),
 }
 
 pub trait AsFailedJob {
     fn as_failed_job(self, report: JobReport, progress: Option<ProgressBar>) -> FailedJob;
 }
 
-impl AsFailedJob for ExecutionError {
+impl AsFailedJob for JobError {
     fn as_failed_job(self, report: JobReport, progress: Option<ProgressBar>) -> FailedJob {
         FailedJob::new(self, report, progress)
     }

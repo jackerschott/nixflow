@@ -1,8 +1,8 @@
-use super::ExecutionError;
+use super::JobError;
 
 #[derive(Debug)]
 pub struct ErrorCatcher {
-    pub warnings: Vec<ExecutionError>,
+    pub warnings: Vec<JobError>,
     pub as_dummy: bool,
 }
 impl ErrorCatcher {
@@ -18,11 +18,11 @@ pub trait TryCatch<T, JobExecutionError> {
     ) -> Result<Option<T>, JobExecutionError>;
 }
 
-impl<T> TryCatch<T, ExecutionError> for Result<T, ExecutionError> {
+impl<T> TryCatch<T, JobError> for Result<T, JobError> {
     fn try_catch(
         self,
         catcher: &mut ErrorCatcher,
-    ) -> Result<Option<T>, ExecutionError> {
+    ) -> Result<Option<T>, JobError> {
         match self {
             Ok(value) => Ok(Some(value)),
             Err(err) if !catcher.as_dummy => {

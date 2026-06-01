@@ -5,10 +5,10 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
 };
 
-use crate::nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions};
+use crate::{nix_environment::{FlakeOutput, FlakeSource, NixEnvironment, NixRunCommandOptions}, workflow::job::execution::JobExecutionCommand};
 
 use super::{
-    job::Job,
+    job::{execution::ExecutionMethod, Job},
     specification::{Step, WorkflowSpecification},
 };
 
@@ -56,25 +56,39 @@ impl JobGraph {
         specification: WorkflowSpecification,
         nix_environment: &Box<dyn NixEnvironment>,
         flake_path: &Path,
+        profile: &str,
+        execution_method: ExecutionMethod,
     ) -> JobGraph {
         fn add_jobs_from_step(
             graph: &mut Acyclic<DiGraph<MaybeTransitioning<Job>, ()>>,
             step: Step,
             nix_environment: &Box<dyn NixEnvironment>,
             flake_path: &Path,
+            profile: &str,
+            execution_method: ExecutionMethod,
         ) -> NodeIndex {
             let run_command = nix_environment.run_command(
-                FlakeOutput::new(FlakeSource::Path(flake_path.to_owned()), step.name.clone()),
+                FlakeOutput::new(
+                    FlakeSource::Path(flake_path.to_owned()),
+                    format!("{name}.{profile}", name = step.name),
+                ),
                 NixRunCommandOptions::default().unbuffered(),
             );
 
+            let command = JobExecutionCommand::new(execution_method, &run_command, step.log, step.execution);
             let id = graph.add_node(
-                Job::new(step.executor.execution_command(&run_command), step.info()).into(),
+                Job::new(command, step.info()).into(),
             );
             for (_, input_list) in step.inputs.into_iter() {
                 for input in input_list.inputs.into_iter() {
-                    let parent_id =
-                        add_jobs_from_step(graph, input.parent_step, nix_environment, flake_path);
+                    let parent_id = add_jobs_from_step(
+                        graph,
+                        input.parent_step,
+                        nix_environment,
+                        flake_path,
+                        profile,
+                        execution_method,
+                    );
                     graph.add_edge(parent_id, id, ());
                 }
             }
@@ -85,7 +99,13 @@ impl JobGraph {
         let mut graph = Acyclic::new();
         for (_, targets) in specification.targets.into_iter() {
             for target in targets.into_iter() {
-                add_jobs_from_step(&mut graph, target.parent_step, nix_environment, flake_path);
+                add_jobs_from_step(
+                    &mut graph,
+                    target.parent_step,
+                    nix_environment,
+                    flake_path,
+                    profile,
+                );
             }
         }
 

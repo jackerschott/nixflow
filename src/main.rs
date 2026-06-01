@@ -4,7 +4,13 @@ use miette::{Context, IntoDiagnostic, Result};
 use nix_environment::build_environment;
 use serde::Deserialize;
 use workflow::{
-    generate_specification_string, graph::{execution::{execute_job_graph, GraphExecutionOptions}, JobGraph}, specification::WorkflowSpecification,
+    generate_specification_string,
+    graph::{
+        JobGraph,
+        execution::{GraphExecutionOptions, execute_job_graph},
+    },
+    job::execution::ExecutionOption,
+    specification::WorkflowSpecification,
 };
 
 mod commands;
@@ -23,6 +29,12 @@ struct GlobalConfig {
 struct Cli {
     #[arg(name = "workflow")]
     workflow_flake_path: PathBuf,
+
+    #[arg(short = 'p', long)]
+    profile: String,
+
+    #[arg(short = 'e', long)]
+    executor: ExecutionOption,
 
     #[arg(long)]
     force_nix_portable_usage: bool,
@@ -60,7 +72,7 @@ fn main() -> Result<()> {
     .context("failed to build nix environment")?;
 
     let specification_string =
-        &generate_specification_string(&nix_environment, &cli.workflow_flake_path)
+        &generate_specification_string(&nix_environment, &cli.workflow_flake_path, &cli.profile)
             .into_diagnostic()
             .context(format!(
                 "failed to generate workflow specification from `{workflow_flake}`",
@@ -74,6 +86,7 @@ fn main() -> Result<()> {
         workflow_specification,
         &nix_environment,
         &cli.workflow_flake_path,
+        &cli.profile,
     );
 
     let job_graph = execute_job_graph(
@@ -83,7 +96,8 @@ fn main() -> Result<()> {
             keep_going: cli.keep_going,
             inspection_target: cli.inspect,
         },
-    ).context("failed to execute job graph")?;
+    )
+    .context("failed to execute job graph")?;
 
     job_graph.print_report();
 

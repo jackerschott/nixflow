@@ -1,7 +1,7 @@
 use indicatif::MultiProgress;
 use petgraph::graph::NodeIndex;
 
-use crate::workflow::job::{AsFailedJob, ExecutionError, FailedJob, Job};
+use crate::workflow::job::{AsFailedJob, JobError, FailedJob, Job};
 
 use super::{JobGraph, MaybeTransitioning, progress::build_progress_style};
 
@@ -89,7 +89,7 @@ pub fn update_job(
                 .map(|parent| parent.step().clone())
                 .collect();
 
-            Err(ExecutionError::ParentsFailed { parents }.as_failed_job(job.report(), None))
+            Err(JobError::ParentsFailed { parents }.as_failed_job(job.report(), None))
         }
         job @ Job::Pending(_) => Ok(job),
 
